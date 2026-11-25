@@ -5,6 +5,11 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag name (must match tauri.conf.json version, e.g. v0.1.0)'
+        required: true
+        default: 'v0.1.0'
 
 permissions:
   contents: write
@@ -55,6 +60,11 @@ jobs:
       - name: Install workspace dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Build shared UI package
+        run: |
+          pnpm --filter @repo/ui build:styles
+          pnpm --filter @repo/ui build:components
+
       - name: Build and publish Tauri installers + updater manifest
         uses: tauri-apps/tauri-action@v0
         env:
@@ -63,8 +73,8 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: apps/web
-          tagName: ${{ github.ref_name }}
-          releaseName: 'CineCraft Studio ${{ github.ref_name }}'
+          tagName: ${{ inputs.tag || github.ref_name }}
+          releaseName: 'CineCraft Studio ${{ inputs.tag || github.ref_name }}'
           releaseBody: 'Desktop builds for Windows, macOS, and Linux plus signed auto-updater manifest (latest.json).'
           releaseDraft: false
           prerelease: false
