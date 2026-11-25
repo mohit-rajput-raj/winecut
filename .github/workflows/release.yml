@@ -18,6 +18,7 @@ jobs:
   publish-tauri:
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         include:
           - platform: macos-latest
