@@ -44,7 +44,8 @@
       "endpoints": [
         "https://github.com/mohit-rajput-raj/winecut/releases/latest/download/latest.json"
       ],
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDVFQTk2NDU3NEIyQkYxOUQKUldTZDhTdExWMlNwWGh6a05TYldUOGRVN0kxMUlkVkZxZGVsOFhoL0pEUWZRTnQybC96em1PKzcK"
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEY2RkY0QURFNEU4NjUzNDkKUldSSlU0Wk8za3IvOXRwZUF6K2VBNG5ZVG1NQUpHL3MzRmUvbUV4NU5qcWZHdXBCYWE3MDRFM0EK"
+     
     }
   }
 }
