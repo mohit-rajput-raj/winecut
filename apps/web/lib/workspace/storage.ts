@@ -16,7 +16,7 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   authUser: {
     isSignedIn: false,
     name: 'Local Creator',
-    email: 'creator@cinecraft.local',
+    email: 'creator@winecut.local',
     plan: 'Studio Free',
     provider: 'guest',
   },

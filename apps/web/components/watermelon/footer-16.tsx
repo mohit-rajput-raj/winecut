@@ -51,7 +51,7 @@ export function Footer16({ releasesUrl, repoUrl, onSelectSection }: Footer16Prop
       >
         <svg viewBox="0 0 1120 150" className="-mb-10 w-full sm:-mb-14">
           <defs>
-            <linearGradient id="cinecraftFooterGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+            <linearGradient id="winecutFooterGrad" x1="0%" y1="0%" x2="0%" y2="100%">
               <stop offset="0%" stopColor="#52525b" stopOpacity="0.65" />
               <stop offset="100%" stopColor="#14171f" stopOpacity="0.1" />
             </linearGradient>
@@ -60,10 +60,10 @@ export function Footer16({ releasesUrl, repoUrl, onSelectSection }: Footer16Prop
             x="50%"
             y="122"
             textAnchor="middle"
-            fill="url(#cinecraftFooterGrad)"
+            fill="url(#winecutFooterGrad)"
             className="font-sans text-[134px] font-semibold tracking-tight uppercase"
           >
-            CINECRAFT
+            WINECUT
           </text>
         </svg>
       </div>
@@ -85,7 +85,7 @@ export function Footer16({ releasesUrl, repoUrl, onSelectSection }: Footer16Prop
                   <Film className="h-4 w-4" />
                 </div>
                 <span className="text-sm font-semibold tracking-tight text-zinc-100">
-                  CineCraft Studio
+                  Winecut
                 </span>
                 <span className="rounded bg-[#161922] px-1.5 py-0.5 font-mono text-[10px] text-zinc-400">
                   v0.1.0
@@ -215,7 +215,7 @@ export function Footer16({ releasesUrl, repoUrl, onSelectSection }: Footer16Prop
 
           <div className="mt-8 flex flex-col items-start justify-between gap-4 border-t border-white/10 pt-6 text-xs text-zinc-500 sm:flex-row sm:items-center">
             <div className="font-mono text-[11px]">
-              CineCraft Studio · Local FFmpeg &amp; WebCodecs Processing
+              Winecut · Local FFmpeg &amp; WebCodecs Processing
             </div>
 
             <div className="flex items-center gap-4 text-zinc-400">

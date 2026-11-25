@@ -86,10 +86,10 @@ export function EditorHeader({ onOpenExport }: EditorHeaderProps) {
           </div>
           <div className="flex flex-col">
             <span className="text-xs font-semibold tracking-tight text-zinc-100 leading-none">
-              CineCraft
+              Winecut
             </span>
             <span className="text-[10px] text-zinc-400 font-mono leading-tight">
-              Studio 2
+              Studio
             </span>
           </div>
         </div>

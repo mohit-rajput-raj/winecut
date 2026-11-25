@@ -1,12 +1,12 @@
 [package]
-name = "cinecraft-studio"
+name = "winecut"
 version = "0.1.0"
-description = "CineCraft Studio - Professional Video Editor"
-authors = ["CineCraft Team"]
+description = "Winecut - Multi-Track Video Editor"
+authors = ["Winecut Team"]
 edition = "2021"
 
 [lib]
-name = "cinecraft_studio_lib"
+name = "winecut_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

@@ -75,7 +75,7 @@ jobs:
         with:
           projectPath: apps/web
           tagName: ${{ inputs.tag || github.ref_name }}
-          releaseName: 'CineCraft Studio ${{ inputs.tag || github.ref_name }}'
+          releaseName: 'Winecut ${{ inputs.tag || github.ref_name }}'
           releaseBody: 'Desktop builds for Windows, macOS, and Linux plus signed auto-updater manifest (latest.json).'
           releaseDraft: false
           prerelease: false

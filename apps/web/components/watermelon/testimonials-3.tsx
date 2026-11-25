@@ -103,7 +103,7 @@ export function Testimonials3() {
           Built for daily timeline work
         </h2>
         <p className="text-sm text-zinc-400">
-          Notes from editors using CineCraft Studio for multi-track cuts, 9:16 speaker splits, and local MP4 delivery.
+          Notes from editors using Winecut for multi-track cuts, 9:16 speaker splits, and local MP4 delivery.
         </p>
       </div>
 

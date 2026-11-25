@@ -87,7 +87,7 @@ export function HomeDashboard() {
             </div>
             <div>
               <h1 className="text-sm font-bold text-white tracking-tight leading-none">
-                CineCraft Studio
+                Winecut
               </h1>
               <span className="text-[10px] font-mono text-zinc-500">
                 Desktop NLE · v2.0

@@ -73,7 +73,7 @@ export function DesktopUpdaterNotice() {
             Update available: v{update.version}
           </div>
           <p className="text-[11px] text-zinc-400 leading-relaxed">
-            Install the signed release package and restart CineCraft Studio.
+            Install the signed release package and restart Winecut.
           </p>
         </div>
         <button

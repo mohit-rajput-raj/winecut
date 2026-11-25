@@ -328,8 +328,8 @@ fn get_default_app_paths() -> serde_json::Value {
         let home = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\Users\\Public".to_string());
         let local_app = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| home.clone());
         return serde_json::json!({
-            "cachePath": format!("{}\\CineCraft\\cache", local_app),
-            "downloadsPath": format!("{}\\Videos\\CineCraft", home),
+            "cachePath": format!("{}\\Winecut\\cache", local_app),
+            "downloadsPath": format!("{}\\Videos\\Winecut", home),
             "separator": "\\"
         });
     }
@@ -338,8 +338,8 @@ fn get_default_app_paths() -> serde_json::Value {
     {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
         return serde_json::json!({
-            "cachePath": format!("{}/Library/Caches/CineCraft", home),
-            "downloadsPath": format!("{}/Movies/CineCraft", home),
+            "cachePath": format!("{}/Library/Caches/Winecut", home),
+            "downloadsPath": format!("{}/Movies/Winecut", home),
             "separator": "/"
         });
     }
@@ -348,8 +348,8 @@ fn get_default_app_paths() -> serde_json::Value {
     {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
         return serde_json::json!({
-            "cachePath": format!("{}/.cache/CineCraft", home),
-            "downloadsPath": format!("{}/Videos/CineCraft", home),
+            "cachePath": format!("{}/.cache/Winecut", home),
+            "downloadsPath": format!("{}/Videos/Winecut", home),
             "separator": "/"
         });
     }
@@ -406,12 +406,12 @@ pub fn run() {
             resolve_system_font
         ])
         .setup(|_app| {
-            // Ensure default CineCraft directories exist on startup
+            // Ensure default Winecut directories exist on startup
             let _ = fs::create_dir_all("D:\\Editor\\downloads");
             let _ = fs::create_dir_all("D:\\Editor\\cache\\projects");
             let _ = fs::create_dir_all("D:\\Editor\\cache\\media");
             Ok(())
         })
         .run(tauri::generate_context!())
-        .expect("error while running CineCraft Studio");
+        .expect("error while running Winecut");
 }

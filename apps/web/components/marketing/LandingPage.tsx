@@ -136,7 +136,7 @@ const OS_PACKAGES: Record<
     secondaryFormat: 'Signed updater archive (.app.tar.gz)',
     arch: 'Apple Silicon & Intel',
     actionLabel: 'Download for macOS',
-    note: 'Stores cache in ~/Library/Caches/CineCraft and exports in ~/Movies/CineCraft.',
+    note: 'Stores cache in ~/Library/Caches/Winecut and exports in ~/Movies/Winecut.',
   },
   linux: {
     name: 'Linux',
@@ -201,7 +201,7 @@ export function LandingPage() {
   const jsonLd = {
     '@context': 'https://schema.org',
     '@type': 'SoftwareApplication',
-    name: 'CineCraft Studio',
+    name: 'Winecut',
     applicationCategory: 'MultimediaApplication',
     operatingSystem: 'Windows 10, Windows 11, macOS 12+, Linux x86_64, Web Browser',
     softwareVersion: '0.1.0',
@@ -257,7 +257,7 @@ export function LandingPage() {
           <div className="mt-8 overflow-hidden rounded-2xl bg-[#12151c] p-2 sm:p-3 shadow-[0_28px_80px_rgba(0,0,0,0.72),inset_0px_1px_0px_0px_rgba(255,255,255,0.06)]">
             <img
               src="/studio/Screenshot%202026-11-25%20190655.png"
-              alt="CineCraft Studio real editor workspace showing media bin, monitor smart guides, inspector sliders, and multi-track timeline"
+              alt="Winecut real editor workspace showing media bin, monitor smart guides, inspector sliders, and multi-track timeline"
               loading="eager"
               className="w-full rounded-xl object-cover"
             />
@@ -527,7 +527,7 @@ export function LandingPage() {
           <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
             <div className="space-y-2">
               <h2 className="text-2xl font-semibold tracking-tight text-zinc-100 sm:text-3xl">
-                Download CineCraft Studio
+                Download Winecut
               </h2>
               <p className="text-sm text-zinc-400">
                 Choose an installer for your operating system. All packages come from GitHub Releases.

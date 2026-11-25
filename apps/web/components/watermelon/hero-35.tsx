@@ -121,7 +121,7 @@ export function Hero35({
       <div className="pointer-events-none absolute inset-0 z-0">
         <img
           src={HERO_BG_URL}
-          alt="CineCraft Studio atmospheric dark production backdrop"
+          alt="Winecut atmospheric dark production backdrop"
           loading="eager"
           className="h-full w-full object-cover object-center opacity-55"
         />
@@ -146,7 +146,7 @@ export function Hero35({
             <Film className="h-4 w-4" />
           </div>
           <span className="text-sm font-semibold tracking-tight text-zinc-100">
-            CineCraft Studio
+            Winecut
           </span>
           <span className="rounded bg-[#161922]/90 px-1.5 py-0.5 font-mono text-[10px] text-zinc-400">
             v0.1.0

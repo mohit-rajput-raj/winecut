@@ -192,7 +192,7 @@ export function SettingsPage() {
               <div>
                 <h2 className="text-lg font-bold text-white">Storage & Folder Locations</h2>
                 <p className="text-xs text-zinc-400 mt-1">
-                  Configure where CineCraft saves exported MP4 videos and caches project drafts & media files.
+                  Configure where Winecut saves exported MP4 videos and caches project drafts & media files.
                 </p>
               </div>
 
@@ -425,7 +425,7 @@ export function SettingsPage() {
                           authUser: {
                             isSignedIn: false,
                             name: 'Local Creator',
-                            email: 'creator@cinecraft.local',
+                            email: 'creator@winecut.local',
                             plan: 'Studio Free',
                             provider: 'guest',
                           },

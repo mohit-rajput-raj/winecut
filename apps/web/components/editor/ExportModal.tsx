@@ -185,7 +185,7 @@ export function ExportModal({ isOpen, onClose }: ExportModalProps) {
   const [customFileName, setCustomFileName] = useState<string | null>(null);
 
   const saveFolderPath = customSaveFolder ?? (settings.downloadsPath || 'D:\\Editor\\downloads');
-  const defaultCleanName = (project.name || 'CineCraft_Video')
+  const defaultCleanName = (project.name || 'Winecut_Video')
     .replace(/[^a-zA-Z0-9_-]/g, '_')
     .replace(/_+/g, '_');
   const fileName = customFileName ?? `${defaultCleanName}_${resolution}_${fps}fps.mp4`;
