@@ -1,0 +1,10 @@
+target/
+gen/schemas/
+*.pdb
+*.rlib
+*.lib
+*.exe
+*.msi
+*.dmg
+*.AppImage
+*.deb

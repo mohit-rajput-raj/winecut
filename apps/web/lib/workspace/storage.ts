@@ -44,8 +44,9 @@ function encodePathHex(filePath: string): string {
 
 export function normalizeJoin(base: string, ...parts: string[]): string {
   const cleanBase = (base || '').replace(/[\\/]+$/, '');
+  const sep = cleanBase.includes('\\') || /^[A-Za-z]:/.test(cleanBase) ? '\\' : '/';
   const cleanParts = parts.map((p) => p.replace(/^[\\/]+|[\\/]+$/g, '')).filter(Boolean);
-  return [cleanBase, ...cleanParts].join('\\');
+  return [cleanBase, ...cleanParts].join(sep);
 }
 
 // ---------- IndexedDB Browser Fallback for Media Caching ----------
@@ -112,11 +113,13 @@ async function idbDeleteBlob(key: string): Promise<void> {
 // ---------- Settings Persistence ----------
 export async function loadAppSettings(): Promise<AppSettings> {
   let settings = { ...DEFAULT_APP_SETTINGS };
+  let hasStoredLocal = false;
 
   if (typeof window !== 'undefined') {
     try {
       const raw = localStorage.getItem(LOCAL_SETTINGS_KEY);
       if (raw) {
+        hasStoredLocal = true;
         const parsed = JSON.parse(raw);
         settings = {
           ...DEFAULT_APP_SETTINGS,
@@ -128,6 +131,15 @@ export async function loadAppSettings(): Promise<AppSettings> {
   }
 
   if (isTauriRuntime()) {
+    try {
+      const osPaths = await invoke<{ cachePath: string; downloadsPath: string }>('get_default_app_paths');
+      const isMacOrLinux = typeof navigator !== 'undefined' && /Mac|Linux|X11/i.test(navigator.platform || navigator.userAgent);
+      if (!hasStoredLocal || (isMacOrLinux && settings.cachePath.startsWith('D:\\'))) {
+        settings.cachePath = osPaths.cachePath;
+        settings.downloadsPath = osPaths.downloadsPath;
+      }
+    } catch {}
+
     try {
       const settingsFile = normalizeJoin(settings.cachePath, 'settings.json');
       const diskRaw = await invoke<string>('read_text_file', { path: settingsFile });
@@ -141,7 +153,7 @@ export async function loadAppSettings(): Promise<AppSettings> {
         localStorage.setItem(LOCAL_SETTINGS_KEY, JSON.stringify(settings));
       }
     } catch {
-      // First run: persist initial defaults to cachePath\settings.json
+      // First run: persist OS-appropriate defaults to cachePath/settings.json
       await saveAppSettings(settings).catch(() => {});
     }
   }

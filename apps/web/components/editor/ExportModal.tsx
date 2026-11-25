@@ -8,7 +8,7 @@ import { EditorProject } from '../../lib/editor/types';
 import { secondsToTimecode } from '../../lib/editor/time-utils';
 import { buildCssFilter, buildMasterFilter, getExportDimensions } from '../../lib/editor/render-utils';
 import { runNativeFFmpegExport } from '../../lib/editor/ffmpeg-export';
-import { isTauriRuntime, openPathInExplorer, saveExportedVideoToDisk } from '../../lib/workspace/storage';
+import { isTauriRuntime, normalizeJoin, openPathInExplorer, saveExportedVideoToDisk } from '../../lib/workspace/storage';
 import { Button } from '../ui/button';
 import { Badge } from '../ui/badge';
 import { 
@@ -233,7 +233,7 @@ export function ExportModal({ isOpen, onClose }: ExportModalProps) {
     }
   };
 
-  const fullSavePath = `${saveFolderPath.replace(/[\\/]+$/, '')}\\${fileName}`;
+  const fullSavePath = normalizeJoin(saveFolderPath, fileName);
 
   const handleStartExport = async () => {
     if (exportState === 'rendering') return;

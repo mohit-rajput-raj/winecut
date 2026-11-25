@@ -226,8 +226,17 @@ export async function runNativeFFmpegExport({
   const audioInputLabels: string[] = [];
   let nextInputIdx = 0;
 
-  // Dedicated Windows TrueType bold font path (avoid drawtext family lookup crash)
-  const windowsBoldFont = 'C\\:/Windows/Fonts/arialbd.ttf';
+  // Resolve cross-platform TrueType font path (Windows / macOS / Linux) to avoid fontconfig family lookup crashes
+  let resolvedFontOpt = "font='Sans'";
+  try {
+    const rawFont = await invoke<string>('resolve_system_font');
+    if (rawFont) {
+      const normalized = rawFont.replace(/\\/g, '/').replace(/^([A-Za-z]):/, '$1\\:');
+      resolvedFontOpt = `fontfile='${normalized}'`;
+    }
+  } catch {
+    resolvedFontOpt = "fontfile='C\\:/Windows/Fonts/arialbd.ttf'";
+  }
 
   if (isClipping) {
     // =========================================================
@@ -428,7 +437,7 @@ export async function runNativeFFmpegExport({
         const nextTxtLabel = `txt_${++stepCount}`;
 
         filterChains.push(
-          `[${currentCanvasLabel}]drawtext=fontfile='${windowsBoldFont}':text='${safeText}':fontsize=${fontSize}:fontcolor=${fontColor}:box=1:boxcolor=${boxColor}:boxborderw=14:x=(w-text_w)/2+${dx}:y=h*0.84-text_h/2+${dy}:enable='between(t,${startStr},${endStr})'[${nextTxtLabel}]`
+          `[${currentCanvasLabel}]drawtext=${resolvedFontOpt}:text='${safeText}':fontsize=${fontSize}:fontcolor=${fontColor}:box=1:boxcolor=${boxColor}:boxborderw=14:x=(w-text_w)/2+${dx}:y=h*0.84-text_h/2+${dy}:enable='between(t,${startStr},${endStr})'[${nextTxtLabel}]`
         );
         currentCanvasLabel = nextTxtLabel;
       }

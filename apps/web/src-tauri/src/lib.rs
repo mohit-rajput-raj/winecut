@@ -263,25 +263,130 @@ fn get_cache_stats(cache_dir: String) -> Result<serde_json::Value, String> {
 #[tauri::command]
 fn open_in_explorer(path: String) -> Result<(), String> {
     let p = Path::new(&path);
-    if p.is_file() {
-        Command::new("explorer")
-            .args(["/select,", &path])
-            .spawn()
-            .map_err(|e| format!("Failed to open Explorer: {}", e))?;
-    } else {
-        let _ = fs::create_dir_all(p);
-        Command::new("explorer")
-            .arg(&path)
-            .spawn()
-            .map_err(|e| format!("Failed to open Explorer: {}", e))?;
+
+    #[cfg(target_os = "windows")]
+    {
+        if p.is_file() {
+            Command::new("explorer")
+                .args(["/select,", &path])
+                .spawn()
+                .map_err(|e| format!("Failed to open Explorer: {}", e))?;
+        } else {
+            let _ = fs::create_dir_all(p);
+            Command::new("explorer")
+                .arg(&path)
+                .spawn()
+                .map_err(|e| format!("Failed to open Explorer: {}", e))?;
+        }
     }
+
+    #[cfg(target_os = "macos")]
+    {
+        if p.is_file() {
+            Command::new("open")
+                .args(["-R", &path])
+                .spawn()
+                .map_err(|e| format!("Failed to reveal in Finder: {}", e))?;
+        } else {
+            let _ = fs::create_dir_all(p);
+            Command::new("open")
+                .arg(&path)
+                .spawn()
+                .map_err(|e| format!("Failed to open Finder: {}", e))?;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let target = if p.is_file() {
+            p.parent().unwrap_or(p)
+        } else {
+            let _ = fs::create_dir_all(p);
+            p
+        };
+        Command::new("xdg-open")
+            .arg(target)
+            .spawn()
+            .map_err(|e| format!("Failed to open file manager: {}", e))?;
+    }
+
     Ok(())
+}
+
+#[tauri::command]
+fn get_default_app_paths() -> serde_json::Value {
+    #[cfg(target_os = "windows")]
+    {
+        // Keep D:\Editor when present or chosen, otherwise fall back cleanly to user profile directories
+        if Path::new("D:\\Editor").exists() || Path::new("D:\\").exists() {
+            return serde_json::json!({
+                "cachePath": "D:\\Editor\\cache",
+                "downloadsPath": "D:\\Editor\\downloads",
+                "separator": "\\"
+            });
+        }
+        let home = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\Users\\Public".to_string());
+        let local_app = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| home.clone());
+        return serde_json::json!({
+            "cachePath": format!("{}\\CineCraft\\cache", local_app),
+            "downloadsPath": format!("{}\\Videos\\CineCraft", home),
+            "separator": "\\"
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        return serde_json::json!({
+            "cachePath": format!("{}/Library/Caches/CineCraft", home),
+            "downloadsPath": format!("{}/Movies/CineCraft", home),
+            "separator": "/"
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        return serde_json::json!({
+            "cachePath": format!("{}/.cache/CineCraft", home),
+            "downloadsPath": format!("{}/Videos/CineCraft", home),
+            "separator": "/"
+        });
+    }
+}
+
+#[tauri::command]
+fn resolve_system_font() -> String {
+    let candidates: &[&str] = &[
+        #[cfg(target_os = "windows")]
+        "C:/Windows/Fonts/arialbd.ttf",
+        #[cfg(target_os = "windows")]
+        "C:/Windows/Fonts/arial.ttf",
+        #[cfg(target_os = "macos")]
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+        #[cfg(target_os = "macos")]
+        "/System/Library/Fonts/Helvetica.ttc",
+        #[cfg(target_os = "linux")]
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        #[cfg(target_os = "linux")]
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        #[cfg(target_os = "linux")]
+        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+    ];
+    for c in candidates {
+        if Path::new(c).exists() {
+            return (*c).to_string();
+        }
+    }
+    String::new()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
             check_ffmpeg_installed,
             probe_media_streams,
@@ -296,7 +401,9 @@ pub fn run() {
             list_cached_projects,
             delete_cached_project,
             get_cache_stats,
-            open_in_explorer
+            open_in_explorer,
+            get_default_app_paths,
+            resolve_system_font
         ])
         .setup(|_app| {
             // Ensure default CineCraft directories exist on startup

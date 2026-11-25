@@ -33,6 +33,18 @@ yarn-error.log*
 # vercel
 .vercel
 
+# tauri & rust build artifacts
+/src-tauri/target/
+/src-tauri/gen/schemas/
+*.pdb
+*.rlib
+*.lib
+*.exe
+*.msi
+*.dmg
+*.AppImage
+*.deb
+
 
 # Tauri / Rust build outputs
 /src-tauri/target/
