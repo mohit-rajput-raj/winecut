@@ -9,6 +9,7 @@ import { ArrowRight, Download, Film } from 'lucide-react';
 export interface Hero35Props {
   downloadLabel: string;
   downloadUrl: string;
+  isDirectDownload?: boolean;
   packageSummary: string;
   onSelectSection: (id: string) => void;
 }
@@ -112,6 +113,7 @@ function DotGridMark() {
 export function Hero35({
   downloadLabel,
   downloadUrl,
+  isDirectDownload = false,
   packageSummary,
   onSelectSection,
 }: Hero35Props) {
@@ -281,8 +283,8 @@ export function Hero35({
             >
               <a
                 href={downloadUrl}
-                target="_blank"
-                rel="noopener noreferrer"
+                target={isDirectDownload ? undefined : '_blank'}
+                rel={isDirectDownload ? undefined : 'noopener noreferrer'}
                 className="inline-flex h-11 items-center gap-2 rounded-full bg-zinc-100 px-5 text-xs font-semibold text-zinc-950 transition-colors hover:bg-white"
               >
                 <Download className="h-4 w-4" />

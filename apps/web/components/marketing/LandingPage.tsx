@@ -5,7 +5,7 @@ import { Testimonials3 } from '../watermelon/testimonials-3';
 import { Footer16 } from '../watermelon/footer-16';
 /* eslint-disable @next/next/no-img-element */
 
-import React, { useState, useSyncExternalStore } from 'react';
+import React, { useEffect, useState, useSyncExternalStore } from 'react';
 import Link from 'next/link';
 import {
   Film,
@@ -25,12 +25,18 @@ import {
   Magnet,
 } from 'lucide-react';
 import { Button } from '../ui/button';
+import {
+  formatBytes,
+  fetchLatestRelease,
+  filterInstallerAssets,
+  groupInstallerAssetsByOS,
+  RELEASES_URL,
+  REPO_URL,
+  type GitHubRelease,
+  type TargetOS,
+} from '../../lib/releases';
 
-type TargetOS = 'windows' | 'macos' | 'linux';
 type ShowcaseToolId = 'timeline' | 'framer' | 'color' | 'export';
-
-const RELEASES_URL = 'https://github.com/mohit-rajput-raj/winecut/releases/latest';
-const REPO_URL = 'https://github.com/mohit-rajput-raj/winecut';
 
 const PHOTOS = {
   heroStudio: 'https://images.unsplash.com/photo-1600353068440-6361ef3a86e8?auto=format&fit=crop&w=1600&q=85',
@@ -190,6 +196,17 @@ export function LandingPage() {
   const [manualOS, setManualOS] = useState<TargetOS | null>(null);
   const detectedOS = manualOS ?? autoOS;
   const [selectedTool, setSelectedTool] = useState<ShowcaseToolId>('timeline');
+  const [latestRelease, setLatestRelease] = useState<GitHubRelease | null>(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void fetchLatestRelease(controller.signal).then((release) => {
+      if (release) {
+        setLatestRelease(release);
+      }
+    });
+    return () => controller.abort();
+  }, []);
 
   const scrollToSection = (id: string) => {
     document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -197,6 +214,14 @@ export function LandingPage() {
 
   const activeTool = TOOL_TABS.find((t) => t.id === selectedTool) || TOOL_TABS[0]!;
   const currentOSInfo = OS_PACKAGES[detectedOS];
+  const releaseTag = latestRelease?.tag_name || 'v0.1.0';
+  const installerAssets = latestRelease ? filterInstallerAssets(latestRelease.assets) : [];
+  const osDownloads = groupInstallerAssetsByOS(installerAssets);
+  const heroPrimaryAsset = osDownloads[detectedOS].primary;
+  const heroDownloadUrl = heroPrimaryAsset?.browser_download_url || RELEASES_URL;
+  const heroPackageSummary = heroPrimaryAsset
+    ? `${releaseTag} · ${heroPrimaryAsset.name} · ${formatBytes(heroPrimaryAsset.size)}`
+    : `${releaseTag} · ${currentOSInfo.primaryFormat} · ${currentOSInfo.arch} · Signed auto-updates`;
 
   const jsonLd = {
     '@context': 'https://schema.org',
@@ -204,7 +229,7 @@ export function LandingPage() {
     name: 'Winecut',
     applicationCategory: 'MultimediaApplication',
     operatingSystem: 'Windows 10, Windows 11, macOS 12+, Linux x86_64, Web Browser',
-    softwareVersion: '0.1.0',
+    softwareVersion: releaseTag.replace(/^v/, ''),
     description:
       'Local-first multi-track video editor, 9:16 dual-speaker clip cutter, and constant-frame-rate MP4 exporter.',
     offers: {
@@ -212,7 +237,7 @@ export function LandingPage() {
       price: '0',
       priceCurrency: 'USD',
     },
-    downloadUrl: RELEASES_URL,
+    downloadUrl: heroDownloadUrl,
   };
 
   return (
@@ -224,8 +249,9 @@ export function LandingPage() {
 
       <Hero35
         downloadLabel={currentOSInfo.actionLabel}
-        downloadUrl={RELEASES_URL}
-        packageSummary={`v0.1.0 · ${currentOSInfo.primaryFormat} · ${currentOSInfo.arch} · Signed auto-updates`}
+        downloadUrl={heroDownloadUrl}
+        isDirectDownload={Boolean(heroPrimaryAsset)}
+        packageSummary={heroPackageSummary}
         onSelectSection={scrollToSection}
       />
 
@@ -530,7 +556,11 @@ export function LandingPage() {
                 Download Winecut
               </h2>
               <p className="text-sm text-zinc-400">
-                Choose an installer for your operating system. All packages come from GitHub Releases.
+                Download {releaseTag} installers directly for your operating system, or open{' '}
+                <Link href="/download" className="text-zinc-200 underline-offset-4 hover:underline">
+                  all installer packages
+                </Link>
+                .
               </p>
             </div>
 
@@ -557,6 +587,11 @@ export function LandingPage() {
             {(['windows', 'macos', 'linux'] as TargetOS[]).map((osKey) => {
               const pkg = OS_PACKAGES[osKey];
               const isSelected = detectedOS === osKey;
+              const osRelease = osDownloads[osKey];
+              const primaryAsset = osRelease.primary;
+              const secondaryAsset = osRelease.secondary;
+              const downloadHref = primaryAsset?.browser_download_url || RELEASES_URL;
+
               return (
                 <div
                   key={osKey}
@@ -585,15 +620,21 @@ export function LandingPage() {
                     </div>
 
                     <div className="space-y-1.5 rounded-lg bg-[#0d0f14] p-3 font-mono text-[11px] text-zinc-300">
-                      <div>{pkg.primaryFormat}</div>
-                      <div className="text-zinc-500">{pkg.secondaryFormat}</div>
+                      <div className="truncate">
+                        {primaryAsset ? primaryAsset.name : pkg.primaryFormat}
+                      </div>
+                      <div className="text-zinc-500">
+                        {primaryAsset
+                          ? `${formatBytes(primaryAsset.size)} · ${releaseTag}`
+                          : pkg.secondaryFormat}
+                      </div>
                       <div className="text-zinc-500">Arch: {pkg.arch}</div>
                     </div>
 
                     <p className="text-xs leading-relaxed text-zinc-400">{pkg.note}</p>
                   </div>
 
-                  <div className="pt-6">
+                  <div className="space-y-2 pt-6">
                     <Button
                       asChild
                       className={`w-full justify-center gap-2 text-xs font-semibold ${
@@ -602,11 +643,28 @@ export function LandingPage() {
                           : 'bg-[#1f2430] text-zinc-100 hover:bg-[#2a3040]'
                       }`}
                     >
-                      <a href={RELEASES_URL} target="_blank" rel="noopener noreferrer">
+                      <a
+                        href={downloadHref}
+                        target={primaryAsset ? undefined : '_blank'}
+                        rel={primaryAsset ? undefined : 'noopener noreferrer'}
+                      >
                         <Download className="h-3.5 w-3.5" />
-                        <span>{pkg.actionLabel}</span>
+                        <span>
+                          {primaryAsset
+                            ? `${pkg.actionLabel} (${formatBytes(primaryAsset.size)})`
+                            : pkg.actionLabel}
+                        </span>
                       </a>
                     </Button>
+
+                    {secondaryAsset && (
+                      <a
+                        href={secondaryAsset.browser_download_url}
+                        className="flex items-center justify-center rounded-md bg-[#0d0f14] px-3 py-1.5 font-mono text-[11px] text-zinc-400 transition-colors hover:bg-[#151923] hover:text-zinc-200"
+                      >
+                        {secondaryAsset.name} ({formatBytes(secondaryAsset.size)})
+                      </a>
+                    )}
                   </div>
                 </div>
               );
