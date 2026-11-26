@@ -195,3 +195,33 @@ export function buildFFmpegGradeFilters(g: ColorGradeValues): string[] {
 
   return filters;
 }
+
+/**
+ * Maps layerFX toggles (chromatic, vhs, blur-zoom, vignette-pulse, film-flicker, flash)
+ * to deterministic FFmpeg filter expressions operating in RGB space so exports match WebGL preview.
+ */
+export function buildFFmpegLayerEffectFilters(layerEffects: string[] = []): string[] {
+  if (!layerEffects || layerEffects.length === 0) return [];
+  const filters: string[] = [];
+
+  if (layerEffects.includes('blur-zoom')) {
+    filters.push('gblur=sigma=5.0');
+  }
+  if (layerEffects.includes('chromatic')) {
+    filters.push('rgbashift=rh=-5:bh=5');
+  }
+  if (layerEffects.includes('vhs')) {
+    filters.push('rgbashift=rh=-2:bh=2', 'noise=alls=8:allf=t+u');
+  }
+  if (layerEffects.includes('film-flicker')) {
+    filters.push("eq=brightness='0.03*sin(t*38)':eval=frame");
+  }
+  if (layerEffects.includes('vignette-pulse')) {
+    filters.push("vignette=angle='0.45+0.25*sin(t*4.5)':eval=frame");
+  }
+  if (layerEffects.includes('flash')) {
+    filters.push("eq=brightness='0.18*pow(max(0,sin(t*12)),6)':eval=frame");
+  }
+
+  return filters;
+}

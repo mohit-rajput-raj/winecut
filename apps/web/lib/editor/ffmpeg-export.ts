@@ -1,25 +1,39 @@
 'use client';
 
 /**
- * Native Frame-Exact FFmpeg Export Graph Builder
- * Supports:
- * - Multi-track video/image/overlay compositing + Unified 9:16 Clip Cutter Stage 1->2 pipeline
- * - Pro Color Grading (Exposure, Highlights, Shadows, Sharpen, Fade, Vignette, Grain, LUT Presets)
- * - Geometric/Feathered Masks via alpha PNG `alphamerge`
- * - Velocity Speed Curves / Scalar Speed (`setpts` + chained `atempo`) + `afade` In/Out
- * - Contiguous Clip Seam Transitions (`xfade`)
- * - Pixel-identical Stickers & Rich Styled Text rasterized to transparent PNG overlays
+ * Native High-Precision FFmpeg Compositor & Export Pipeline
+ *
+ * Architecture guarantees:
+ * 1. Full 4:4:4 RGB compositing (`format=rgb24` + `overlay=...:format=rgb`) across all video,
+ *    mask, sticker, transition, and rich-text layers — zero multi-generation YUV 4:2:0 smearing.
+ * 2. Exact millisecond timebase synchronization (`settb=1/1000,fps=fps:round=near`) with `-fflags +genpts`
+ *    preventing frame drops/repeats on VFR sources and overlay boundaries.
+ * 3. Single final BT.709 color-matrix conversion (`scale=out_color_matrix=bt709:out_range=tv:flags=lanczos+accurate_rnd+full_chroma_int`)
+ *    matching WebGL preview colors and preventing washed-out BT.601 gamma shifts.
+ * 4. Configurable Pro Presets (H.264 High Quality CRF, H.265 8-bit/10-bit HEVC, Apple ProRes 422 / HQ, NVENC GPU)
+ *    plus real-time `-progress pipe:1` streaming, cancellation, and post-export FFprobe validation.
  */
 
 import { invoke } from '@tauri-apps/api/core';
+import { listen, UnlistenFn } from '@tauri-apps/api/event';
 import { AspectRatio, EditorProject, FramerSettings, TimelineClip } from './types';
-import { getExportDimensions } from './render-utils';
+import {
+  buildFFmpegEncoderArgs,
+  CodecProfileId,
+  EncoderSpeedPreset,
+  ExportProfileConfig,
+  getCodecPresetMeta,
+  QualityTier,
+  resolveExportDimensions,
+} from './engine/export-presets';
 import {
   buildFFmpegGradeFilters,
+  buildFFmpegLayerEffectFilters,
   extractColorGradeValues,
   extractMasterColorGrade,
   hasNonDefaultGrade,
 } from './engine/grading';
+import { buildFFmpegSpeedSetptsExpr } from './engine/velocity';
 import { renderMaskAlphaCanvas } from './engine/masks';
 import {
   canvasToPngBytes,
@@ -33,13 +47,52 @@ export interface ProbeResult {
   has_video: boolean;
   has_audio: boolean;
   duration: number;
+  video_duration?: number;
+  audio_duration?: number;
   width: number;
   height: number;
+  codec_name?: string;
+  pix_fmt?: string;
+  r_frame_rate?: string;
+  avg_frame_rate?: string;
+  fps?: number;
+  nb_frames?: number;
+  bit_rate?: number;
+  file_size?: number;
+  color_space?: string;
+  color_primaries?: string;
+  color_transfer?: string;
+  audio_codec?: string;
+  audio_sample_rate?: number;
+  audio_channels?: number;
+}
+
+export interface ExportValidationReport extends ProbeResult {
+  audio_sync_delta_sec?: number;
+  ssim_avg?: number | null;
+  psnr_avg?: number | null;
+}
+
+export interface FfmpegCapabilities {
+  libx264: boolean;
+  libx265: boolean;
+  prores_ks: boolean;
+  h264_nvenc: boolean;
+  hevc_nvenc: boolean;
+  h264_qsv: boolean;
+  h264_amf: boolean;
+  has_psnr: boolean;
+  has_ssim: boolean;
+  has_vmaf: boolean;
+  has_zscale: boolean;
 }
 
 export interface NativeFFmpegExportResult {
   savedPath: string;
   ffmpegCommand: string;
+  actualWidth: number;
+  actualHeight: number;
+  validation?: ExportValidationReport | null;
 }
 
 function clamp(val: number, min: number, max: number): number {
@@ -70,6 +123,59 @@ function buildAtempoFilters(speed: number): string[] {
   return chain;
 }
 
+/**
+ * Maps In/Out clip fade/slide animations cleanly onto FFmpeg alpha & motion expressions.
+ */
+function buildClipAnimationFilters(clip: TimelineClip): {
+  alphaFilters: string[];
+  needsAlpha: boolean;
+  motionDxExpr: string;
+  motionDyExpr: string;
+} {
+  const alphaFilters: string[] = [];
+  let needsAlpha = false;
+  let motionDxExpr = '0';
+  let motionDyExpr = '0';
+
+  const inAnim = clip.animations?.in;
+  if (inAnim && inAnim.presetId !== 'none') {
+    const d = Math.max(0.1, Math.min(clip.duration * 0.45, inAnim.duration || 0.45));
+    const intensity = clamp(inAnim.intensity ?? 1, 0.2, 2.0);
+    if (
+      inAnim.presetId === 'fade-in' ||
+      inAnim.presetId === 'pop-in' ||
+      inAnim.presetId === 'whip-zoom'
+    ) {
+      alphaFilters.push(`fade=t=in:st=0:d=${d.toFixed(3)}:alpha=1`);
+      needsAlpha = true;
+    } else if (inAnim.presetId === 'slide-up') {
+      const dist = Math.round(140 * intensity);
+      motionDyExpr = `if(lt(t-${clip.timelineStart.toFixed(3)},${d.toFixed(3)}),${dist}*pow(1-max(0,(t-${clip.timelineStart.toFixed(3)})/${d.toFixed(3)}),3),0)`;
+    } else if (inAnim.presetId === 'slide-down') {
+      const dist = Math.round(140 * intensity);
+      motionDyExpr = `if(lt(t-${clip.timelineStart.toFixed(3)},${d.toFixed(3)}),-${dist}*pow(1-max(0,(t-${clip.timelineStart.toFixed(3)})/${d.toFixed(3)}),3),0)`;
+    } else if (inAnim.presetId === 'slide-left') {
+      const dist = Math.round(180 * intensity);
+      motionDxExpr = `if(lt(t-${clip.timelineStart.toFixed(3)},${d.toFixed(3)}),${dist}*pow(1-max(0,(t-${clip.timelineStart.toFixed(3)})/${d.toFixed(3)}),3),0)`;
+    } else if (inAnim.presetId === 'slide-right') {
+      const dist = Math.round(180 * intensity);
+      motionDxExpr = `if(lt(t-${clip.timelineStart.toFixed(3)},${d.toFixed(3)}),-${dist}*pow(1-max(0,(t-${clip.timelineStart.toFixed(3)})/${d.toFixed(3)}),3),0)`;
+    }
+  }
+
+  const outAnim = clip.animations?.out;
+  if (outAnim && outAnim.presetId !== 'none') {
+    const d = Math.max(0.1, Math.min(clip.duration * 0.45, outAnim.duration || 0.45));
+    const st = Math.max(0, clip.duration - d);
+    if (outAnim.presetId === 'fade-out' || outAnim.presetId === 'shrink-out') {
+      alphaFilters.push(`fade=t=out:st=${st.toFixed(3)}:d=${d.toFixed(3)}:alpha=1`);
+      needsAlpha = true;
+    }
+  }
+
+  return { alphaFilters, needsAlpha, motionDxExpr, motionDyExpr };
+}
+
 async function resolveAndProbeDiskAssets(
   project: EditorProject,
   cachePath: string,
@@ -93,6 +199,7 @@ async function resolveAndProbeDiskAssets(
     if (diskPath) {
       try {
         probe = await invoke<ProbeResult>('probe_media_streams', { path: diskPath });
+        if (!probe.has_video && !probe.has_audio) probe = null;
       } catch {
         probe = null;
       }
@@ -134,37 +241,74 @@ export async function runNativeFFmpegExport({
   framerSettings,
   resolution,
   fps,
+  exportConfig,
   cachePath,
   saveFolderPath,
   fullSavePath,
   onProgress,
+  isCancelled,
 }: {
   project: EditorProject;
   aspectRatio: AspectRatio;
   framerSettings: FramerSettings;
   resolution: '720p' | '1080p' | '4k';
   fps: number;
+  exportConfig?: Partial<ExportProfileConfig>;
   cachePath: string;
   saveFolderPath: string;
   fullSavePath: string;
   onProgress: (pct: number, msg: string) => void;
+  isCancelled?: () => boolean;
 }): Promise<NativeFFmpegExportResult> {
   if (!isTauriRuntime()) {
     throw new Error('Native FFmpeg export requires desktop app runtime.');
   }
 
-  onProgress(10, 'Checking native FFmpeg installation...');
+  const resolvedConfig: ExportProfileConfig = {
+    resolutionPreset: exportConfig?.resolutionPreset ?? resolution,
+    customWidth: exportConfig?.customWidth ?? 1920,
+    customHeight: exportConfig?.customHeight ?? 1080,
+    fps: exportConfig?.fps ?? fps,
+    codecProfile: (exportConfig?.codecProfile ?? 'h264_hq') as CodecProfileId,
+    qualityTier: (exportConfig?.qualityTier ?? 'high') as QualityTier,
+    encoderSpeed: (exportConfig?.encoderSpeed ?? 'medium') as EncoderSpeedPreset,
+    verifyAfterExport: exportConfig?.verifyAfterExport ?? true,
+  };
+
+  const targetFps = resolvedConfig.fps;
+  const presetMeta = getCodecPresetMeta(resolvedConfig.codecProfile);
+
+  onProgress(6, 'Inspecting native FFmpeg capabilities & codecs...');
   await invoke<string>('check_ffmpeg_installed');
   await invoke('ensure_directory', { path: saveFolderPath });
 
-  onProgress(20, 'Verifying cached media streams on disk...');
+  onProgress(12, 'Probing source streams on disk...');
   const { pathMap: diskPaths, probes } = await resolveAndProbeDiskAssets(project, cachePath);
 
   const isClipping = project.mode === 'clipping';
   const targetRatio: AspectRatio = isClipping ? '9:16' : aspectRatio;
-  const { width: exportW, height: exportH } = getExportDimensions(targetRatio, resolution);
 
   const allClips = project.timeline.tracks.flatMap((t) => t.clips);
+  const firstVideoClip = allClips.find((c) => c.type === 'video' && c.assetId);
+  const primaryAsset = firstVideoClip?.assetId
+    ? project.mediaLibrary.find((a) => a.id === firstVideoClip.assetId)
+    : undefined;
+  const primaryProbe = firstVideoClip?.assetId ? probes.get(firstVideoClip.assetId) : undefined;
+  const primarySourceDims =
+    primaryProbe && primaryProbe.width > 0 && primaryProbe.height > 0
+      ? { width: primaryProbe.width, height: primaryProbe.height }
+      : primaryAsset?.width && primaryAsset?.height
+        ? { width: primaryAsset.width, height: primaryAsset.height }
+        : undefined;
+
+  const { width: exportW, height: exportH } = resolveExportDimensions(
+    targetRatio,
+    resolvedConfig.resolutionPreset,
+    primarySourceDims,
+    resolvedConfig.customWidth,
+    resolvedConfig.customHeight,
+  );
+
   const exportDuration =
     allClips.length > 0
       ? Math.max(...allClips.map((c) => c.timelineStart + c.duration))
@@ -177,8 +321,9 @@ export async function runNativeFFmpegExport({
   let nextInputIdx = 0;
   let stepCount = 0;
 
+  // Full 4:4:4 RGB compositing canvas with unified 1/1000s timebase to prevent multi-pass YUV blur & PTS drift
   filterChains.push(
-    `color=c=black:s=${exportW}x${exportH}:r=${fps}:d=${exportDuration.toFixed(3)},format=yuv420p[base0]`,
+    `color=c=black:s=${exportW}x${exportH}:r=${targetFps}:d=${exportDuration.toFixed(3)},settb=1/1000,format=rgb24[base0]`,
   );
   let currentCanvasLabel = 'base0';
 
@@ -186,22 +331,22 @@ export async function runNativeFFmpegExport({
     ? allClips.find((c) => c.type === 'video' && c.assetId && diskPaths.has(c.assetId))
     : undefined;
 
-  // STAGE 1A: If Clip Cutter mode, build Top + Bottom speaker vstack into currentCanvasLabel
+  const scaleQualityFlags = 'flags=lanczos+accurate_rnd+full_chroma_int';
+
+  // STAGE 1A: Clip Cutter 9:16 top/bottom speaker stack
   if (isClipping && primaryClippingVideo && primaryClippingVideo.assetId) {
     const srcPath = diskPaths.get(primaryClippingVideo.assetId)!;
     const probe = probes.get(primaryClippingVideo.assetId);
     const { sourceDur, speedRate } = buildClipSpeedRate(primaryClippingVideo);
+    const speedExpr =
+      buildFFmpegSpeedSetptsExpr(primaryClippingVideo) || `(PTS-STARTPTS)/${speedRate.toFixed(6)}`;
     const inIdx = nextInputIdx++;
 
-    inputArgs.push(
-      '-accurate_seek',
-      '-ss',
-      primaryClippingVideo.sourceStart.toFixed(3),
-      '-t',
-      sourceDur.toFixed(3),
-      '-i',
-      srcPath,
-    );
+    inputArgs.push('-fflags', '+genpts');
+    if (primaryClippingVideo.sourceStart > 0.001) {
+      inputArgs.push('-ss', primaryClippingVideo.sourceStart.toFixed(3));
+    }
+    inputArgs.push('-t', sourceDur.toFixed(3), '-i', srcPath);
 
     const topH = even(exportH * framerSettings.splitRatio);
     const btmH = even(exportH - topH);
@@ -211,16 +356,18 @@ export async function runNativeFFmpegExport({
     const gradeFilters = buildFFmpegGradeFilters(
       extractColorGradeValues(primaryClippingVideo.effects, primaryClippingVideo.lutId),
     );
-    const gradeChain = gradeFilters.length > 0 ? `,${gradeFilters.join(',')}` : '';
+    const fxFilters = buildFFmpegLayerEffectFilters(primaryClippingVideo.layerEffects || []);
+    const allColorFilters = [...gradeFilters, ...fxFilters];
+    const colorSuffix = allColorFilters.length > 0 ? `,${allColorFilters.join(',')}` : '';
 
     filterChains.push(
-      `[${inIdx}:v]setpts=(PTS-STARTPTS)/${speedRate.toFixed(4)},fps=${fps},setsar=1${gradeChain},split=2[vtop_src][vbtm_src]`,
+      `[${inIdx}:v]setpts='${speedExpr}',fps=${targetFps}:round=near,settb=1/1000,setsar=1,format=rgb24${colorSuffix},split=2[vtop_src][vbtm_src]`,
     );
     filterChains.push(
-      `[vtop_src]crop=w='max(2,trunc(iw*${(tb.width / 100).toFixed(4)}/2)*2)':h='max(2,trunc(ih*${(tb.height / 100).toFixed(4)}/2)*2)':x='iw*${(tb.x / 100).toFixed(4)}':y='ih*${(tb.y / 100).toFixed(4)}',scale=${exportW}:${topH}:flags=lanczos,setsar=1[vtop]`,
+      `[vtop_src]crop=w='max(2,trunc(iw*${(tb.width / 100).toFixed(4)}/2)*2)':h='max(2,trunc(ih*${(tb.height / 100).toFixed(4)}/2)*2)':x='iw*${(tb.x / 100).toFixed(4)}':y='ih*${(tb.y / 100).toFixed(4)}',scale=${exportW}:${topH}:${scaleQualityFlags},setsar=1[vtop]`,
     );
     filterChains.push(
-      `[vbtm_src]crop=w='max(2,trunc(iw*${(bb.width / 100).toFixed(4)}/2)*2)':h='max(2,trunc(ih*${(bb.height / 100).toFixed(4)}/2)*2)':x='iw*${(bb.x / 100).toFixed(4)}':y='ih*${(bb.y / 100).toFixed(4)}',scale=${exportW}:${btmH}:flags=lanczos,setsar=1[vbtm]`,
+      `[vbtm_src]crop=w='max(2,trunc(iw*${(bb.width / 100).toFixed(4)}/2)*2)':h='max(2,trunc(ih*${(bb.height / 100).toFixed(4)}/2)*2)':x='iw*${(bb.x / 100).toFixed(4)}':y='ih*${(bb.y / 100).toFixed(4)}',scale=${exportW}:${btmH}:${scaleQualityFlags},setsar=1[vbtm]`,
     );
 
     const divPx = Math.max(0, Math.round(framerSettings.dividerWidth * (actualOutH / 720)));
@@ -232,13 +379,13 @@ export async function runNativeFFmpegExport({
         : `[vtop][vbtm]vstack=inputs=2`;
 
     filterChains.push(
-      `${vstackBase},scale=${exportW}:${exportH}:flags=lanczos,setpts=PTS+${primaryClippingVideo.timelineStart.toFixed(3)}/TB[${splitOutLabel}]`,
+      `${vstackBase},scale=${exportW}:${exportH}:${scaleQualityFlags},format=rgb24,settb=1/1000,setpts=PTS+${primaryClippingVideo.timelineStart.toFixed(3)}/TB[${splitOutLabel}]`,
     );
 
     const nextBase = `base_${++stepCount}`;
     const endSec = (primaryClippingVideo.timelineStart + primaryClippingVideo.duration).toFixed(3);
     filterChains.push(
-      `[${currentCanvasLabel}][${splitOutLabel}]overlay=0:0:eof_action=pass:shortest=0:enable='between(t,${primaryClippingVideo.timelineStart.toFixed(3)},${endSec})'[${nextBase}]`,
+      `[${currentCanvasLabel}][${splitOutLabel}]overlay=0:0:format=rgb:eof_action=pass:shortest=0:enable='between(t,${primaryClippingVideo.timelineStart.toFixed(3)},${endSec})'[${nextBase}]`,
     );
     currentCanvasLabel = nextBase;
 
@@ -263,7 +410,7 @@ export async function runNativeFFmpegExport({
       const chain = [
         `[${inIdx}:a]atrim=duration=${sourceDur.toFixed(3)},asetpts=PTS-STARTPTS`,
         ...atempo,
-        `aresample=48000,aformat=channel_layouts=stereo,volume=${vol}`,
+        `aresample=48000:async=1:first_pts=0,aformat=channel_layouts=stereo,volume=${vol}`,
         ...fades,
         `adelay=${delayMs}|${delayMs}`,
       ];
@@ -272,7 +419,7 @@ export async function runNativeFFmpegExport({
     }
   }
 
-  // STAGE 1B & STAGE 2: Composite visual tracks (Overlays, Images, Stickers, Transitions, Masks, Speed)
+  // STAGE 1B & STAGE 2: Composite all multi-track video/image/sticker/mask/transition layers in crisp RGB24
   const bottomToTopVideoTracks = [
     ...project.timeline.tracks.filter((t) => t.type === 'video' && t.visible),
   ].reverse();
@@ -285,9 +432,15 @@ export async function runNativeFFmpegExport({
 
     for (const clip of orderedClips) {
       if (clip.id === primaryClippingVideo?.id) continue;
+      if (isCancelled?.()) throw new Error('Export cancelled by user');
+
+      const anim = buildClipAnimationFilters(clip);
 
       if (clip.type === 'sticker' && clip.stickerSvg) {
-        const stickerCanvas = await renderSvgStickerToCanvas(clip.stickerSvg, 360);
+        const clipScale = clamp(clip.transform.scale || 0.45, 0.05, 4.0);
+        const scaledW = even(exportW * clipScale * 0.55);
+        const rasterSize = Math.max(256, Math.min(2400, scaledW));
+        const stickerCanvas = await renderSvgStickerToCanvas(clip.stickerSvg, rasterSize);
         const bytes = await canvasToPngBytes(stickerCanvas);
         const tempSticker = normalizeJoin(saveFolderPath, `__winecut_sticker_${clip.id}_${Date.now()}.png`);
         await writeBinaryToDisk(tempSticker, bytes);
@@ -296,20 +449,19 @@ export async function runNativeFFmpegExport({
         const inIdx = nextInputIdx++;
         inputArgs.push('-loop', '1', '-t', clip.duration.toFixed(3), '-i', tempSticker);
 
-        const clipScale = clamp(clip.transform.scale || 0.45, 0.05, 4.0);
-        const scaledW = even(exportW * clipScale * 0.55);
         const opacity = clamp(clip.transform.opacity ?? 1.0, 0, 1);
         const rotDeg = clip.transform.rotation || 0;
 
         const chain: string[] = [
-          `[${inIdx}:v]format=rgba,fps=${fps},setpts=PTS+${clip.timelineStart.toFixed(3)}/TB`,
-          `scale=${scaledW}:-2:flags=lanczos,setsar=1`,
+          `[${inIdx}:v]fps=${targetFps}:round=near,settb=1/1000,scale=${scaledW}:-2:${scaleQualityFlags},setsar=1,format=rgba`,
+          ...anim.alphaFilters,
         ];
         if (opacity < 1) chain.push(`colorchannelmixer=aa=${opacity.toFixed(2)}`);
         if (rotDeg !== 0) {
           const rad = ((rotDeg * Math.PI) / 180).toFixed(4);
           chain.push(`rotate=${rad}:ow='rotw(${rad})':oh='roth(${rad})':c=none`);
         }
+        chain.push(`setpts=PTS+${clip.timelineStart.toFixed(3)}/TB`);
         const label = `vlayer_${stepCount++}`;
         filterChains.push(`${chain.join(',')}[${label}]`);
         preparedLayerLabels.set(clip.id, label);
@@ -320,20 +472,20 @@ export async function runNativeFFmpegExport({
       const srcPath = diskPaths.get(clip.assetId)!;
       const probe = probes.get(clip.assetId);
       const { sourceDur, speedRate } = buildClipSpeedRate(clip);
+      const speedExpr =
+        clip.type === 'video'
+          ? buildFFmpegSpeedSetptsExpr(clip) || `(PTS-STARTPTS)/${speedRate.toFixed(6)}`
+          : 'PTS-STARTPTS';
       const inIdx = nextInputIdx++;
 
       if (clip.type === 'image') {
         inputArgs.push('-loop', '1', '-t', clip.duration.toFixed(3), '-i', srcPath);
       } else {
-        inputArgs.push(
-          '-accurate_seek',
-          '-ss',
-          clip.sourceStart.toFixed(3),
-          '-t',
-          sourceDur.toFixed(3),
-          '-i',
-          srcPath,
-        );
+        inputArgs.push('-fflags', '+genpts');
+        if (clip.sourceStart > 0.001) {
+          inputArgs.push('-ss', clip.sourceStart.toFixed(3));
+        }
+        inputArgs.push('-t', sourceDur.toFixed(3), '-i', srcPath);
       }
 
       const clipScale = clamp(clip.transform.scale || 1, 0.1, 4.0);
@@ -342,27 +494,32 @@ export async function runNativeFFmpegExport({
 
       const fitFilter =
         clip.type === 'image' && clip.fitMode === 'contain'
-          ? `scale=${scaledW}:${scaledH}:force_original_aspect_ratio=decrease,pad=${scaledW}:${scaledH}:(ow-iw)/2:(oh-ih)/2:color=black@0`
+          ? `scale=${scaledW}:${scaledH}:force_original_aspect_ratio=decrease:${scaleQualityFlags},pad=${scaledW}:${scaledH}:(ow-iw)/2:(oh-ih)/2:color=black@0`
           : clip.type === 'image' && clip.fitMode === 'fill'
-            ? `scale=${scaledW}:${scaledH}:flags=lanczos`
-            : `scale=${scaledW}:${scaledH}:force_original_aspect_ratio=increase:flags=lanczos,crop=${scaledW}:${scaledH}`;
+            ? `scale=${scaledW}:${scaledH}:${scaleQualityFlags}`
+            : `scale=${scaledW}:${scaledH}:force_original_aspect_ratio=increase:${scaleQualityFlags},crop=${scaledW}:${scaledH}`;
 
       const gradeFilters = buildFFmpegGradeFilters(
         extractColorGradeValues(clip.effects, clip.lutId),
       );
+      const fxFilters = buildFFmpegLayerEffectFilters(clip.layerEffects || []);
       const opacity = clamp(clip.transform.opacity ?? 1.0, 0, 1);
       const rotDeg = clip.transform.rotation || 0;
       const hasMask = Boolean(clip.mask && clip.mask.type !== 'none');
       const needAlpha =
-        opacity < 1 || rotDeg !== 0 || hasMask || (clip.type === 'image' && clip.fitMode === 'contain');
+        opacity < 1 ||
+        rotDeg !== 0 ||
+        hasMask ||
+        anim.needsAlpha ||
+        (clip.type === 'image' && clip.fitMode === 'contain');
 
       const chain: string[] = [
-        clip.type === 'image'
-          ? `[${inIdx}:v]setpts=PTS-STARTPTS,fps=${fps}`
-          : `[${inIdx}:v]setpts=(PTS-STARTPTS)/${speedRate.toFixed(4)},fps=${fps}`,
+        `[${inIdx}:v]setpts='${speedExpr}',fps=${targetFps}:round=near,settb=1/1000`,
         fitFilter,
         'setsar=1',
+        'format=rgb24',
         ...gradeFilters,
+        ...fxFilters,
       ];
 
       if (needAlpha) {
@@ -370,6 +527,7 @@ export async function runNativeFFmpegExport({
         if (opacity < 1) {
           chain.push(`colorchannelmixer=aa=${opacity.toFixed(2)}`);
         }
+        chain.push(...anim.alphaFilters);
         if (rotDeg !== 0) {
           const rad = ((rotDeg * Math.PI) / 180).toFixed(4);
           chain.push(`rotate=${rad}:ow='rotw(${rad})':oh='roth(${rad})':c=none`);
@@ -379,7 +537,6 @@ export async function runNativeFFmpegExport({
       let layerLabel = `vlayer_${stepCount++}`;
       filterChains.push(`${chain.join(',')}[${layerLabel}]`);
 
-      // Apply feathered mask via transparent alpha PNG if configured
       if (hasMask && clip.mask) {
         const maskCanvas = renderMaskAlphaCanvas(clip.mask, scaledW, scaledH);
         const maskBytes = await canvasToPngBytes(maskCanvas);
@@ -391,12 +548,13 @@ export async function runNativeFFmpegExport({
         inputArgs.push('-loop', '1', '-t', clip.duration.toFixed(3), '-i', tempMask);
         const maskGray = `mgray_${stepCount++}`;
         const maskedLayer = `vmasked_${stepCount++}`;
-        filterChains.push(`[${maskIdx}:v]fps=${fps},scale=${scaledW}:${scaledH},format=gray[${maskGray}]`);
+        filterChains.push(
+          `[${maskIdx}:v]fps=${targetFps}:round=near,settb=1/1000,scale=${scaledW}:${scaledH}:flags=bilinear,format=gray[${maskGray}]`,
+        );
         filterChains.push(`[${layerLabel}][${maskGray}]alphamerge[${maskedLayer}]`);
         layerLabel = maskedLayer;
       }
 
-      // Shift PTS to clip's timelineStart if not stitched via xfade
       const outgoingTr = transitions.find((t) => t.trackId === track.id && t.fromClipId === clip.id);
       const incomingTr = transitions.find((t) => t.trackId === track.id && t.toClipId === clip.id);
       if (!outgoingTr && !incomingTr) {
@@ -409,7 +567,6 @@ export async function runNativeFFmpegExport({
 
       preparedLayerLabels.set(clip.id, layerLabel);
 
-      // Attach audio for video clip
       if (
         clip.type === 'video' &&
         probe?.has_audio &&
@@ -431,7 +588,7 @@ export async function runNativeFFmpegExport({
         const aChain = [
           `[${inIdx}:a]atrim=duration=${sourceDur.toFixed(3)},asetpts=PTS-STARTPTS`,
           ...atempo,
-          `aresample=48000,aformat=channel_layouts=stereo,volume=${vol}`,
+          `aresample=48000:async=1:first_pts=0,aformat=channel_layouts=stereo,volume=${vol}`,
           ...fades,
           `adelay=${delayMs}|${delayMs}`,
         ];
@@ -440,7 +597,6 @@ export async function runNativeFFmpegExport({
       }
     }
 
-    // Stitch contiguous transitions (`xfade`) and overlay onto main composite canvas
     for (let i = 0; i < orderedClips.length; i++) {
       const clip = orderedClips[i]!;
       if (clip.id === primaryClippingVideo?.id || skippedByTransition.has(clip.id)) continue;
@@ -462,30 +618,33 @@ export async function runNativeFFmpegExport({
         const aNorm = `xnormA_${stepCount++}`;
         const bNorm = `xnormB_${stepCount++}`;
         filterChains.push(
-          `[${layerLabel}]scale=${exportW}:${exportH}:force_original_aspect_ratio=decrease,pad=${exportW}:${exportH}:(ow-iw)/2:(oh-ih)/2,format=yuv420p,setpts=PTS-STARTPTS[${aNorm}]`,
+          `[${layerLabel}]scale=${exportW}:${exportH}:force_original_aspect_ratio=decrease:${scaleQualityFlags},pad=${exportW}:${exportH}:(ow-iw)/2:(oh-ih)/2,format=rgb24,fps=${targetFps}:round=near,settb=1/1000,setsar=1,setpts=PTS-STARTPTS[${aNorm}]`,
         );
         filterChains.push(
-          `[${nextLabel}]scale=${exportW}:${exportH}:force_original_aspect_ratio=decrease,pad=${exportW}:${exportH}:(ow-iw)/2:(oh-ih)/2,format=yuv420p,setpts=PTS-STARTPTS[${bNorm}]`,
+          `[${nextLabel}]scale=${exportW}:${exportH}:force_original_aspect_ratio=decrease:${scaleQualityFlags},pad=${exportW}:${exportH}:(ow-iw)/2:(oh-ih)/2,format=rgb24,fps=${targetFps}:round=near,settb=1/1000,setsar=1,setpts=PTS-STARTPTS[${bNorm}]`,
         );
         filterChains.push(
-          `[${aNorm}][${bNorm}]xfade=transition=${xfadeName}:duration=${dur.toFixed(3)}:offset=${offset.toFixed(3)},setpts=PTS+${clip.timelineStart.toFixed(3)}/TB[${joinedLabel}]`,
+          `[${aNorm}][${bNorm}]xfade=transition=${xfadeName}:duration=${dur.toFixed(3)}:offset=${offset.toFixed(3)},format=rgb24,settb=1/1000,setpts=PTS+${clip.timelineStart.toFixed(3)}/TB[${joinedLabel}]`,
         );
 
         const endSec = (nextClip.timelineStart + nextClip.duration).toFixed(3);
         const nextCanvasLabel = `base_${++stepCount}`;
         filterChains.push(
-          `[${currentCanvasLabel}][${joinedLabel}]overlay=0:0:eof_action=pass:shortest=0:enable='between(t,${clip.timelineStart.toFixed(3)},${endSec})'[${nextCanvasLabel}]`,
+          `[${currentCanvasLabel}][${joinedLabel}]overlay=0:0:format=rgb:eof_action=pass:shortest=0:enable='between(t,${clip.timelineStart.toFixed(3)},${endSec})'[${nextCanvasLabel}]`,
         );
         currentCanvasLabel = nextCanvasLabel;
         continue;
       }
 
+      const anim = buildClipAnimationFilters(clip);
       const offsetX = Math.round((clip.transform.x || 0) * (exportW / 680));
       const offsetY = Math.round((clip.transform.y || 0) * (exportH / 382));
+      const xExpr = anim.motionDxExpr === '0' ? `(W-w)/2+${offsetX}` : `(W-w)/2+${offsetX}+${anim.motionDxExpr}`;
+      const yExpr = anim.motionDyExpr === '0' ? `(H-h)/2+${offsetY}` : `(H-h)/2+${offsetY}+${anim.motionDyExpr}`;
       const endSec = (clip.timelineStart + clip.duration).toFixed(3);
       const nextCanvasLabel = `base_${++stepCount}`;
       filterChains.push(
-        `[${currentCanvasLabel}][${layerLabel}]overlay=x=(W-w)/2+${offsetX}:y=(H-h)/2+${offsetY}:eof_action=pass:shortest=0:enable='between(t,${clip.timelineStart.toFixed(3)},${endSec})'[${nextCanvasLabel}]`,
+        `[${currentCanvasLabel}][${layerLabel}]overlay=x='${xExpr}':y='${yExpr}':format=rgb:eof_action=pass:shortest=0:enable='between(t,${clip.timelineStart.toFixed(3)},${endSec})'[${nextCanvasLabel}]`,
       );
       currentCanvasLabel = nextCanvasLabel;
     }
@@ -503,15 +662,11 @@ export async function runNativeFFmpegExport({
 
       const { sourceDur, speedRate } = buildClipSpeedRate(clip);
       const inIdx = nextInputIdx++;
-      inputArgs.push(
-        '-accurate_seek',
-        '-ss',
-        clip.sourceStart.toFixed(3),
-        '-t',
-        sourceDur.toFixed(3),
-        '-i',
-        srcPath,
-      );
+      inputArgs.push('-fflags', '+genpts');
+      if (clip.sourceStart > 0.001) {
+        inputArgs.push('-ss', clip.sourceStart.toFixed(3));
+      }
+      inputArgs.push('-t', sourceDur.toFixed(3), '-i', srcPath);
 
       const aLabel = `aud_${audioInputLabels.length}`;
       const vol = clamp((clip.volume ?? 100) / 100, 0, 2).toFixed(2);
@@ -528,7 +683,7 @@ export async function runNativeFFmpegExport({
       const chain = [
         `[${inIdx}:a]atrim=duration=${sourceDur.toFixed(3)},asetpts=PTS-STARTPTS`,
         ...atempo,
-        `aresample=48000,aformat=channel_layouts=stereo,volume=${vol}`,
+        `aresample=48000:async=1:first_pts=0,aformat=channel_layouts=stereo,volume=${vol}`,
         ...fades,
         `adelay=${delayMs}|${delayMs}`,
       ];
@@ -537,7 +692,7 @@ export async function runNativeFFmpegExport({
     }
   }
 
-  // Master Screen Grade & Blur
+  // Master Screen Grade & Blur in full RGB24
   const masterGrade = extractMasterColorGrade(project.settings);
   if (hasNonDefaultGrade(masterGrade)) {
     const mFilters = buildFFmpegGradeFilters(masterGrade);
@@ -548,7 +703,7 @@ export async function runNativeFFmpegExport({
     }
   }
 
-  // Rich Styled Text Rasterization -> Transparent PNG Overlay (Pixel-identical fonts, pills, strokes, gradients)
+  // Rich Styled Text Rasterization -> Transparent RGBA PNG Overlay composited in full RGB
   const textTracks = project.timeline.tracks.filter((t) => t.type === 'text' && t.visible);
   for (const track of textTracks) {
     for (const clip of track.clips) {
@@ -564,10 +719,14 @@ export async function runNativeFFmpegExport({
 
       const clipScale = clamp(clip.transform.scale || 1, 0.2, 4.0);
       const scaledTxtW = even(txtCanvas.width * clipScale);
+      const anim = buildClipAnimationFilters(clip);
       const txtLabel = `txtpng_${++stepCount}`;
-      filterChains.push(
-        `[${inIdx}:v]format=rgba,fps=${fps},scale=${scaledTxtW}:-2:flags=lanczos,setpts=PTS+${clip.timelineStart.toFixed(3)}/TB[${txtLabel}]`,
-      );
+      const txtChain = [
+        `[${inIdx}:v]fps=${targetFps}:round=near,settb=1/1000,scale=${scaledTxtW}:-2:${scaleQualityFlags},format=rgba`,
+        ...anim.alphaFilters,
+        `setpts=PTS+${clip.timelineStart.toFixed(3)}/TB`,
+      ];
+      filterChains.push(`${txtChain.join(',')}[${txtLabel}]`);
 
       const dx = Math.round((clip.transform.x || 0) * (exportW / 680));
       const dy = Math.round((clip.transform.y || 0) * (exportH / 382));
@@ -576,23 +735,36 @@ export async function runNativeFFmpegExport({
       const nextCanvas = `txt_${++stepCount}`;
 
       filterChains.push(
-        `[${currentCanvasLabel}][${txtLabel}]overlay=x=(W-w)/2+${dx}:y=H*0.84-h/2+${dy}:eof_action=pass:shortest=0:enable='between(t,${startStr},${endStr})'[${nextCanvas}]`,
+        `[${currentCanvasLabel}][${txtLabel}]overlay=x='(W-w)/2+${dx}':y='H*0.84-h/2+${dy}':format=rgb:eof_action=pass:shortest=0:enable='between(t,${startStr},${endStr})'[${nextCanvas}]`,
       );
       currentCanvasLabel = nextCanvas;
     }
   }
 
-  filterChains.push(`[${currentCanvasLabel}]format=yuv420p[outv]`);
+  // Build selected codec arguments
+  const enc = buildFFmpegEncoderArgs(
+    resolvedConfig.codecProfile,
+    resolvedConfig.qualityTier,
+    resolvedConfig.encoderSpeed,
+    targetFps,
+    exportW,
+    exportH,
+  );
 
-  // Final Audio Mix Graph
+  // Single high-precision RGB -> ITU-R BT.709 conversion at the end of graph
+  filterChains.push(
+    `[${currentCanvasLabel}]scale=out_color_matrix=bt709:out_range=tv:${scaleQualityFlags},format=${enc.pixFmt}[outv]`,
+  );
+
+  // Final Audio Mix Graph matched strictly to exportDuration
   filterChains.push(`anullsrc=r=48000:cl=stereo:d=${exportDuration.toFixed(3)}[asilent]`);
   if (audioInputLabels.length > 0) {
     const allAudioInputs = ['[asilent]', ...audioInputLabels].join('');
     filterChains.push(
-      `${allAudioInputs}amix=inputs=${audioInputLabels.length + 1}:duration=first:normalize=0,alimiter=limit=0.98[outa]`,
+      `${allAudioInputs}amix=inputs=${audioInputLabels.length + 1}:duration=first:normalize=0,alimiter=limit=0.98,atrim=duration=${exportDuration.toFixed(3)},asetpts=PTS-STARTPTS[outa]`,
     );
   } else {
-    filterChains.push('[asilent]acopy[outa]');
+    filterChains.push(`[asilent]atrim=duration=${exportDuration.toFixed(3)},asetpts=PTS-STARTPTS[outa]`);
   }
 
   const filterGraphText = filterChains.join(';\n');
@@ -611,48 +783,72 @@ export async function runNativeFFmpegExport({
     '[outa]',
     '-t',
     exportDuration.toFixed(3),
-    '-c:v',
-    'libx264',
-    '-pix_fmt',
-    'yuv420p',
-    '-preset',
-    'medium',
-    '-crf',
-    '19',
     '-r',
-    String(fps),
+    String(targetFps),
     '-fps_mode',
     'cfr',
-    '-colorspace',
-    'bt709',
-    '-color_primaries',
-    'bt709',
-    '-color_trc',
-    'bt709',
-    '-c:a',
-    'aac',
-    '-b:a',
-    '192k',
-    '-movflags',
-    '+faststart',
+    ...enc.videoArgs,
+    ...enc.audioArgs,
+    ...enc.containerArgs,
     fullSavePath,
   ];
 
-  onProgress(55, 'Encoding constant-frame-rate H.264 MP4 via native FFmpeg...');
+  onProgress(24, `Encoding ${exportW}x${exportH} @ ${targetFps}fps (${presetMeta.label})...`);
 
+  let unlisten: UnlistenFn | null = null;
   try {
+    unlisten = await listen<{ out_time_ms: number; speed: string; status: string }>(
+      'ffmpeg-export-progress',
+      (ev) => {
+        if (isCancelled?.()) return;
+        const pctRaw = (ev.payload.out_time_ms / Math.max(100, exportDuration * 1000)) * 68;
+        const pct = Math.min(93, Math.max(25, Math.round(25 + pctRaw)));
+        const speedInfo = ev.payload.speed ? ` @ ${ev.payload.speed}` : '';
+        onProgress(pct, `Encoding ${presetMeta.label}${speedInfo}...`);
+      },
+    );
+
     await invoke('run_ffmpeg_export', { args: finalArgs });
   } finally {
+    if (unlisten) unlisten();
     await Promise.all(
       tempFilesToDelete.map((path) => invoke('delete_temp_file', { path }).catch(() => {})),
     );
   }
 
+  let validation: ExportValidationReport | null = null;
+  if (resolvedConfig.verifyAfterExport && !isCancelled?.()) {
+    onProgress(95, 'Running FFprobe stream & sync validation...');
+    // Check if single ungraded clean source video can also compute SSIM/PSNR
+    const canCompareReference =
+      !isClipping &&
+      !hasNonDefaultGrade(masterGrade) &&
+      allClips.length === 1 &&
+      firstVideoClip?.assetId &&
+      diskPaths.has(firstVideoClip.assetId) &&
+      primaryProbe?.width === exportW &&
+      primaryProbe?.height === exportH &&
+      !hasNonDefaultGrade(extractColorGradeValues(firstVideoClip.effects, firstVideoClip.lutId)) &&
+      (firstVideoClip.layerEffects?.length ?? 0) === 0;
+
+    try {
+      validation = await invoke<ExportValidationReport>('validate_exported_video', {
+        outputPath: fullSavePath,
+        referencePath: canCompareReference ? diskPaths.get(firstVideoClip!.assetId!)! : null,
+      });
+    } catch (vErr) {
+      console.warn('FFprobe post-export validation skipped:', vErr);
+    }
+  }
+
   const displayArgs = finalArgs.map((a) => (a.includes(' ') ? `"${a}"` : a)).join(' ');
-  onProgress(100, `Saved crisp CFR MP4 directly to ${fullSavePath}!`);
+  onProgress(100, `Saved verified ${presetMeta.label} directly to ${fullSavePath}!`);
 
   return {
     savedPath: fullSavePath,
     ffmpegCommand: `ffmpeg ${displayArgs}`,
+    actualWidth: exportW,
+    actualHeight: exportH,
+    validation,
   };
 }

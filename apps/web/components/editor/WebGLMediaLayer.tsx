@@ -260,7 +260,7 @@ export function WebGLMediaLayer({
         clipPath: transitionOverride?.clipPath,
       }}
     >
-      {/* Native hardware-accelerated video/image surface (kept visible to decoder via opacity-0 when WebGL shader is active) */}
+      {/* Native hardware-accelerated video/image surface (absolute inset-0 prevents flex sibling 50% right-shift) */}
       {clip.type === 'video' ? (
         <video
           ref={videoRef}
@@ -271,7 +271,7 @@ export function WebGLMediaLayer({
           crossOrigin="anonymous"
           className={
             useWebGLSurface
-              ? 'w-full h-full object-cover opacity-0 pointer-events-none'
+              ? 'absolute inset-0 w-full h-full object-cover opacity-0 pointer-events-none'
               : `w-full h-full object-cover pointer-events-auto cursor-pointer`
           }
           style={{
@@ -293,7 +293,7 @@ export function WebGLMediaLayer({
           data-clip-id={useWebGLSurface ? undefined : clip.id}
           className={
             useWebGLSurface
-              ? 'w-full h-full object-cover opacity-0 pointer-events-none'
+              ? 'absolute inset-0 w-full h-full object-cover opacity-0 pointer-events-none'
               : `${fitMode === 'contain' ? 'max-w-full max-h-full' : 'w-full h-full'} pointer-events-auto cursor-pointer`
           }
           style={!useWebGLSurface ? { filter: buildCssFilter(clip.effects, clip.lutId) } : undefined}

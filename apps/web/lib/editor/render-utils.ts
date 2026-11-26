@@ -46,24 +46,28 @@ export function buildMasterFilter(settings: ProjectSettings): string {
 
 export function getExportDimensions(
   aspectRatio: AspectRatio,
-  resolution: '720p' | '1080p' | '4k',
+  resolution: 'source' | '720p' | '1080p' | '1440p' | '4k' | 'custom',
 ): { width: number; height: number } {
+  const shortSide =
+    resolution === '4k'
+      ? 2160
+      : resolution === '1440p'
+        ? 1440
+        : resolution === '1080p' || resolution === 'source' || resolution === 'custom'
+          ? 1080
+          : 720;
+
   if (aspectRatio === '9:16') {
-    if (resolution === '1080p') return { width: 1080, height: 1920 };
-    if (resolution === '4k') return { width: 2160, height: 3840 };
-    return { width: 720, height: 1280 };
+    const h = Math.round((shortSide * 16) / 9);
+    return { width: shortSide, height: h % 2 === 0 ? h : h + 1 };
   }
   if (aspectRatio === '1:1') {
-    if (resolution === '1080p') return { width: 1080, height: 1080 };
-    if (resolution === '4k') return { width: 2160, height: 2160 };
-    return { width: 720, height: 720 };
+    return { width: shortSide, height: shortSide };
   }
   if (aspectRatio === '4:5') {
-    if (resolution === '1080p') return { width: 1080, height: 1350 };
-    if (resolution === '4k') return { width: 2160, height: 2700 };
-    return { width: 720, height: 900 };
+    const h = Math.round((shortSide * 5) / 4);
+    return { width: shortSide, height: h % 2 === 0 ? h : h + 1 };
   }
-  if (resolution === '1080p') return { width: 1920, height: 1080 };
-  if (resolution === '4k') return { width: 3840, height: 2160 };
-  return { width: 1280, height: 720 };
+  const w = Math.round((shortSide * 16) / 9);
+  return { width: w % 2 === 0 ? w : w + 1, height: shortSide };
 }

@@ -422,19 +422,24 @@ export async function saveExportedVideoToDisk({
   renderedBlob,
   mimeType,
   fps,
+  passthroughIfMp4 = true,
 }: {
   fullSavePath: string;
   saveFolderPath: string;
   renderedBlob: Blob;
   mimeType: string;
   fps: number;
+  passthroughIfMp4?: boolean;
 }): Promise<ExportSaveResult> {
   const isMp4Source = mimeType.toLowerCase().includes('mp4');
   const tempExt = isMp4Source ? 'mp4' : 'webm';
-  const tempFileName = `__cinecraft_temp_${Date.now()}.${tempExt}`;
+  const tempFileName = `__winecut_temp_${Date.now()}.${tempExt}`;
   const tempPath = normalizeJoin(saveFolderPath, tempFileName);
 
-  const cmdPreview = `ffmpeg -y -i "${tempPath}" -c:v libx264 -pix_fmt yuv420p -preset veryfast -crf 20 -r ${fps} -c:a aac -b:a 192k -movflags +faststart "${fullSavePath}"`;
+  const cmdPreview =
+    isMp4Source && passthroughIfMp4
+      ? `ffmpeg -y -i "${tempPath}" -c copy -movflags +faststart "${fullSavePath}"`
+      : `ffmpeg -y -i "${tempPath}" -c:v libx264 -profile:v high -pix_fmt yuv420p -preset medium -crf 17 -r ${fps} -fps_mode cfr -colorspace bt709 -color_primaries bt709 -color_trc bt709 -c:a aac -b:a 256k -movflags +faststart "${fullSavePath}"`;
 
   if (!isTauriRuntime()) {
     return {
@@ -448,20 +453,37 @@ export async function saveExportedVideoToDisk({
 
   await invoke('ensure_directory', { path: saveFolderPath });
 
+  // Avoid double lossy re-encoding when rendered blob is already high-bitrate WebCodecs MP4
+  if (isMp4Source && passthroughIfMp4 && fullSavePath.toLowerCase().endsWith('.mp4')) {
+    await writeBinaryToDisk(fullSavePath, renderedBlob);
+    return {
+      savedPath: fullSavePath,
+      savedToDisk: true,
+      usedFfmpeg: false,
+      ffmpegCommand: cmdPreview,
+    };
+  }
+
   // Write the rendered composite blob directly via binary IPC
   await writeBinaryToDisk(tempPath, renderedBlob);
 
-  // Run FFmpeg transcode into crisp H.264 MP4 at fullSavePath
+  // Run FFmpeg transcode with HQ CRF 17 & BT.709 color tags at fullSavePath
   const ffmpegArgs = [
     '-y',
     '-i', tempPath,
     '-c:v', 'libx264',
+    '-profile:v', 'high',
     '-pix_fmt', 'yuv420p',
-    '-preset', 'veryfast',
-    '-crf', '20',
+    '-preset', 'medium',
+    '-crf', '17',
     '-r', String(fps),
+    '-fps_mode', 'cfr',
+    '-colorspace', 'bt709',
+    '-color_primaries', 'bt709',
+    '-color_trc', 'bt709',
+    '-color_range', 'tv',
     '-c:a', 'aac',
-    '-b:a', '192k',
+    '-b:a', '256k',
     '-movflags', '+faststart',
     fullSavePath,
   ];

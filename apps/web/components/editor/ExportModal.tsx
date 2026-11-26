@@ -1,13 +1,30 @@
 'use client';
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
 import { useEditor } from '../../lib/editor/EditorContext';
 import { useWorkspace } from '../../lib/workspace/WorkspaceContext';
 import { EditorProject } from '../../lib/editor/types';
 import { secondsToTimecode } from '../../lib/editor/time-utils';
-import { buildCssFilter, buildMasterFilter, getExportDimensions } from '../../lib/editor/render-utils';
-import { runNativeFFmpegExport } from '../../lib/editor/ffmpeg-export';
+import { buildCssFilter, buildMasterFilter } from '../../lib/editor/render-utils';
+import {
+  ExportValidationReport,
+  FfmpegCapabilities,
+  runNativeFFmpegExport,
+} from '../../lib/editor/ffmpeg-export';
+import {
+  CODEC_PRESETS,
+  CodecProfileId,
+  computeWebCodecsTargetBitrate,
+  EncoderSpeedPreset,
+  getCodecPresetMeta,
+  QUALITY_TIER_META,
+  QualityTier,
+  replaceFileExtension,
+  ResolutionPreset,
+  resolveExportDimensions,
+} from '../../lib/editor/engine/export-presets';
 import { WebGL2LayerProcessor } from '../../lib/editor/engine/compositor-webgl';
 import { extractColorGradeValues } from '../../lib/editor/engine/grading';
 import { evaluateClipMotion } from '../../lib/editor/engine/animations';
@@ -48,17 +65,32 @@ interface ExportModalProps {
 
 async function seekElementExact(el: HTMLMediaElement, targetSec: number): Promise<void> {
   const safeTarget = Math.max(0, Math.min(el.duration || targetSec, targetSec));
-  if (Math.abs(el.currentTime - safeTarget) < 0.015 && el.readyState >= 2) {
+  if (Math.abs(el.currentTime - safeTarget) < 0.002 && el.readyState >= 2) {
     return;
   }
   await new Promise<void>((resolve) => {
-    const timeout = setTimeout(() => {
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
       el.removeEventListener('seeked', onSeeked);
       resolve();
-    }, 350);
+    };
+    const timeout = setTimeout(done, 2200);
     const onSeeked = () => {
-      clearTimeout(timeout);
-      resolve();
+      const vid = el as HTMLVideoElement & {
+        requestVideoFrameCallback?: (cb: () => void) => number;
+      };
+      if (el instanceof HTMLVideoElement && typeof vid.requestVideoFrameCallback === 'function') {
+        let rvfcTimer = setTimeout(done, 80);
+        vid.requestVideoFrameCallback(() => {
+          clearTimeout(rvfcTimer);
+          done();
+        });
+      } else {
+        done();
+      }
     };
     el.addEventListener('seeked', onSeeked, { once: true });
     el.currentTime = safeTarget;
@@ -212,17 +244,51 @@ export function ExportModal({ isOpen, onClose }: ExportModalProps) {
   const { settings } = useWorkspace();
   const { project, aspectRatio, framerSettings } = useEditor();
 
-  const [resolution, setResolution] = useState<'720p' | '1080p' | '4k'>(settings.defaultResolution || '720p');
+  const [resolutionPreset, setResolutionPreset] = useState<ResolutionPreset>(
+    settings.defaultResolution || '1080p',
+  );
+  const [customWidth, setCustomWidth] = useState<number>(1920);
+  const [customHeight, setCustomHeight] = useState<number>(1080);
   const [fps, setFps] = useState<number>(settings.defaultFps || 30);
-  
+  const [codecProfile, setCodecProfile] = useState<CodecProfileId>('h264_hq');
+  const [qualityTier, setQualityTier] = useState<QualityTier>('high');
+  const [encoderSpeed, setEncoderSpeed] = useState<EncoderSpeedPreset>('medium');
+  const [verifyAfterExport, setVerifyAfterExport] = useState<boolean>(true);
+  const [capabilities, setCapabilities] = useState<FfmpegCapabilities | null>(null);
+  const [validationReport, setValidationReport] = useState<ExportValidationReport | null>(null);
+
   const [customSaveFolder, setCustomSaveFolder] = useState<string | null>(null);
   const [customFileName, setCustomFileName] = useState<string | null>(null);
+
+  const primaryVideoClip = useMemo(
+    () => project.timeline.tracks.flatMap((t) => t.clips).find((c) => c.type === 'video' && c.assetId),
+    [project.timeline.tracks],
+  );
+  const primaryVideoAsset = useMemo(
+    () => (primaryVideoClip?.assetId ? project.mediaLibrary.find((a) => a.id === primaryVideoClip.assetId) : undefined),
+    [primaryVideoClip, project.mediaLibrary],
+  );
+  const effectiveRatio = project.mode === 'clipping' ? '9:16' : aspectRatio;
+  const resolvedDims = useMemo(
+    () =>
+      resolveExportDimensions(
+        effectiveRatio,
+        resolutionPreset,
+        primaryVideoAsset,
+        customWidth,
+        customHeight,
+      ),
+    [effectiveRatio, resolutionPreset, primaryVideoAsset, customWidth, customHeight],
+  );
+  const codecMeta = useMemo(() => getCodecPresetMeta(codecProfile), [codecProfile]);
 
   const saveFolderPath = customSaveFolder ?? (settings.downloadsPath || 'D:\\Editor\\downloads');
   const defaultCleanName = (project.name || 'Winecut_Video')
     .replace(/[^a-zA-Z0-9_-]/g, '_')
     .replace(/_+/g, '_');
-  const fileName = customFileName ?? `${defaultCleanName}_${resolution}_${fps}fps.mp4`;
+  const rawFileName =
+    customFileName ?? `${defaultCleanName}_${resolvedDims.width}x${resolvedDims.height}_${fps}fps.${codecMeta.extension}`;
+  const fileName = replaceFileExtension(rawFileName, codecMeta.extension);
 
   const [exportState, setExportState] = useState<'idle' | 'rendering' | 'finished' | 'error'>('idle');
   const [progress, setProgress] = useState<number>(0);
@@ -238,15 +304,28 @@ export function ExportModal({ isOpen, onClose }: ExportModalProps) {
 
   useEffect(() => {
     cancelFlagRef.current = !isOpen;
+    if (isOpen && isTauriRuntime()) {
+      invoke<FfmpegCapabilities>('get_ffmpeg_capabilities')
+        .then(setCapabilities)
+        .catch(() => {});
+    }
   }, [isOpen]);
 
   const handleCloseModal = () => {
     cancelFlagRef.current = true;
+    if (exportState === 'rendering' && isTauriRuntime()) {
+      invoke('cancel_ffmpeg_export').catch(() => {});
+    }
+    if (exportedBlobUrl) {
+      URL.revokeObjectURL(exportedBlobUrl);
+      setExportedBlobUrl(null);
+    }
     setExportState('idle');
     setProgress(0);
     setSavedDiskPath(null);
     setFfmpegCommand('');
     setExportWarning(null);
+    setValidationReport(null);
     onClose();
   };
 
@@ -276,17 +355,33 @@ export function ExportModal({ isOpen, onClose }: ExportModalProps) {
     setExportState('rendering');
     setProgress(5);
     setExportWarning(null);
-    setStatusMessage(`Preparing ${resolution} @ ${fps}fps export...`);
+    setValidationReport(null);
+    setStatusMessage(
+      `Preparing ${resolvedDims.width}x${resolvedDims.height} @ ${fps}fps (${codecMeta.label})...`,
+    );
 
-    // 1. PREFERRED PATH: Native Frame-Exact FFmpeg Compositor (ZERO real-time playback glitches or drops!)
+    const legacyRes: '720p' | '1080p' | '4k' =
+      resolutionPreset === '4k' ? '4k' : resolutionPreset === '720p' ? '720p' : '1080p';
+
+    // 1. PREFERRED PATH: Native Full-RGB BT.709 FFmpeg Compositor
     if (isTauriRuntime()) {
       try {
         const res = await runNativeFFmpegExport({
           project,
           aspectRatio,
           framerSettings,
-          resolution,
+          resolution: legacyRes,
           fps,
+          exportConfig: {
+            resolutionPreset,
+            customWidth,
+            customHeight,
+            fps,
+            codecProfile,
+            qualityTier,
+            encoderSpeed,
+            verifyAfterExport,
+          },
           cachePath: settings.cachePath || 'D:\\Editor\\cache',
           saveFolderPath,
           fullSavePath,
@@ -296,29 +391,35 @@ export function ExportModal({ isOpen, onClose }: ExportModalProps) {
               setStatusMessage(msg);
             }
           },
+          isCancelled: () => cancelFlagRef.current,
         });
 
         if (cancelFlagRef.current) return;
 
         setFfmpegCommand(res.ffmpegCommand);
         setSavedDiskPath(res.savedPath);
+        setValidationReport(res.validation ?? null);
         setProgress(100);
         setExportState('finished');
-        setStatusMessage(`Exported smoothly with native FFmpeg CFR pipeline -> ${res.savedPath}`);
+        setStatusMessage(`Exported verified ${res.actualWidth}x${res.actualHeight} @ ${fps}fps -> ${res.savedPath}`);
         return;
-      } catch (ffErr: any) {
-        console.warn('Native FFmpeg graph failed, using offline seek-stepped canvas renderer:', ffErr);
-        setExportWarning(`FFmpeg direct note: ${ffErr?.message || String(ffErr)} — rendered via step-synced canvas fallback.`);
+      } catch (ffErr: unknown) {
+        const msg = ffErr instanceof Error ? ffErr.message : String(ffErr);
+        if (cancelFlagRef.current || msg.toLowerCase().includes('cancelled')) {
+          setExportState('idle');
+          setProgress(0);
+          return;
+        }
+        console.warn('Native FFmpeg graph failed, using step-synced WebGL2 renderer fallback:', ffErr);
+        setExportWarning(`FFmpeg direct note: ${msg} — rendered via step-synced WebGL2 fallback.`);
       }
     }
 
-    // 2. FALLBACK PATH (Browser mode or FFmpeg graph fallback): Frame-Stepped Offline Seeked Canvas Renderer
-    // Avoids setInterval playback jitter by waiting cleanly for each frame's `seeked` event before capture!
+    // 2. FALLBACK PATH (Browser mode or FFmpeg graph fallback): Frame-Stepped Offline WebGL2 Renderer
     const isClippingMode = project.mode === 'clipping';
-    const effectiveRatio = isClippingMode ? '9:16' : aspectRatio;
 
     try {
-      const { width: exportW, height: exportH } = getExportDimensions(effectiveRatio, resolution);
+      const { width: exportW, height: exportH } = resolvedDims;
       const allClips = project.timeline.tracks.flatMap(t => t.clips);
       const exportDuration = allClips.length > 0
         ? Math.max(...allClips.map(c => c.timelineStart + c.duration))
@@ -340,7 +441,10 @@ export function ExportModal({ isOpen, onClose }: ExportModalProps) {
       for (const track of project.timeline.tracks) {
         for (const clip of track.clips) {
           if (clip.type === 'sticker' && clip.stickerSvg) {
-            const stCanvas = await renderSvgStickerToCanvas(clip.stickerSvg, Math.round(exportH * 0.45));
+            const stCanvas = await renderSvgStickerToCanvas(
+              clip.stickerSvg,
+              Math.max(360, Math.round(exportH * 0.65)),
+            );
             stickerCanvasesByClip.set(clip.id, stCanvas);
             continue;
           }
@@ -510,9 +614,11 @@ export function ExportModal({ isOpen, onClose }: ExportModalProps) {
             const grade = extractColorGradeValues(clip.effects, clip.lutId);
             const mediaW = mediaEl instanceof HTMLVideoElement ? (mediaEl.videoWidth || exportW) : (mediaEl.naturalWidth || exportW);
             const mediaH = mediaEl instanceof HTMLVideoElement ? (mediaEl.videoHeight || exportH) : (mediaEl.naturalHeight || exportH);
+            const targetTexW = Math.min(3840, Math.max(exportW, mediaW));
+            const targetTexH = Math.min(3840, Math.max(exportH, mediaH));
             const renderedSource: HTMLVideoElement | HTMLImageElement | HTMLCanvasElement =
               webglProc.isReady() &&
-              webglProc.renderFrame(mediaEl, Math.min(1920, mediaW), Math.min(1080, mediaH), grade, clip.mask, clip.layerEffects || [], currentT)
+              webglProc.renderFrame(mediaEl, targetTexW, targetTexH, grade, clip.mask, clip.layerEffects || [], currentT)
                 ? webglProc.canvas
                 : mediaEl;
 
@@ -586,17 +692,19 @@ export function ExportModal({ isOpen, onClose }: ExportModalProps) {
         }
       };
 
-      // Check WebCodecs support for exact-PTS MP4 muxing (zero slow-motion / wall-clock stretch!)
+      // Check WebCodecs support for exact-PTS High Profile MP4 muxing scaled cleanly for target resolution & FPS
       let webCodecsConfig: { codec: string; muxerCodec: 'avc' | 'vp9' } | null = null;
       const evenW = exportW % 2 === 0 ? exportW : exportW + 1;
       const evenH = exportH % 2 === 0 ? exportH : exportH + 1;
-      const targetBitrate = resolution === '4k' ? 16_000_000 : resolution === '1080p' ? 8_000_000 : 4_500_000;
+      const targetBitrate = computeWebCodecsTargetBitrate(evenW, evenH, fps, qualityTier);
 
       if (typeof VideoEncoder !== 'undefined' && typeof VideoFrame !== 'undefined') {
         const candidates: Array<{ codec: string; muxerCodec: 'avc' | 'vp9' }> = [
+          { codec: 'avc1.640034', muxerCodec: 'avc' }, // H.264 High L5.2 (up to 4K60)
+          { codec: 'avc1.640033', muxerCodec: 'avc' }, // H.264 High L5.1 (4K30)
+          { codec: 'avc1.64002a', muxerCodec: 'avc' }, // H.264 High L4.2 (1080p60)
           { codec: 'avc1.4d002a', muxerCodec: 'avc' },
           { codec: 'avc1.4d001f', muxerCodec: 'avc' },
-          { codec: 'avc1.42001f', muxerCodec: 'avc' },
           { codec: 'vp09.00.10.08', muxerCodec: 'vp9' },
         ];
         for (const cand of candidates) {
@@ -819,6 +927,12 @@ export function ExportModal({ isOpen, onClose }: ExportModalProps) {
       }
 
       webglProc.dispose();
+      for (const v of videoElementsByClip.values()) {
+        v.removeAttribute('src');
+        v.load();
+      }
+      videoElementsByClip.clear();
+      imageElementsByClip.clear();
 
       const finalBlobUrl = URL.createObjectURL(finalBlob);
       setExportedBlobUrl(finalBlobUrl);
@@ -912,49 +1026,167 @@ export function ExportModal({ isOpen, onClose }: ExportModalProps) {
 
           {exportState !== 'rendering' && exportState !== 'finished' && (
             <>
-              <div className="grid grid-cols-2 gap-3 p-3 rounded-lg border border-zinc-800 bg-zinc-900/40">
+              <div className="space-y-3 p-3 rounded-lg border border-zinc-800 bg-zinc-900/40">
                 <div>
-                  <label className="text-[11px] font-semibold text-zinc-400 block mb-1.5">
-                    Resolution (Default 720p)
-                  </label>
-                  <div className="grid grid-cols-3 gap-1.5">
-                    {(['720p', '1080p', '4k'] as const).map((r) => (
+                  <div className="flex items-center justify-between mb-1.5">
+                    <label className="text-[11px] font-semibold text-zinc-400">
+                      Resolution ({resolvedDims.width}×{resolvedDims.height})
+                    </label>
+                    {primaryVideoAsset?.width && (
+                      <span className="text-[10px] font-mono text-zinc-500">
+                        Source: {primaryVideoAsset.width}×{primaryVideoAsset.height}
+                      </span>
+                    )}
+                  </div>
+                  <div className="grid grid-cols-6 gap-1">
+                    {([
+                      { id: 'source', label: 'Source' },
+                      { id: '720p', label: '720p' },
+                      { id: '1080p', label: '1080p' },
+                      { id: '1440p', label: '1440p' },
+                      { id: '4k', label: '4K' },
+                      { id: 'custom', label: 'Custom' },
+                    ] as const).map((r) => (
                       <button
-                        key={r}
+                        key={r.id}
                         type="button"
-                        onClick={() => setResolution(r)}
-                        className={`py-1.5 px-2 rounded text-xs font-mono font-medium border text-center transition-all cursor-pointer ${
-                          resolution === r
+                        onClick={() => setResolutionPreset(r.id)}
+                        className={`py-1.5 px-1 rounded text-[11px] font-mono font-medium border text-center transition-all cursor-pointer ${
+                          resolutionPreset === r.id
                             ? 'border-blue-500 bg-blue-950/60 text-blue-200'
                             : 'border-zinc-800 bg-zinc-950 text-zinc-400 hover:text-zinc-200'
                         }`}
                       >
-                        {r.toUpperCase()}
+                        {r.label}
                       </button>
                     ))}
+                  </div>
+                  {resolutionPreset === 'custom' && (
+                    <div className="grid grid-cols-2 gap-2 mt-2">
+                      <label className="flex items-center gap-1.5 text-[10px] font-mono text-zinc-400">
+                        <span>W</span>
+                        <input
+                          type="number"
+                          min={128}
+                          max={7680}
+                          step={2}
+                          value={customWidth}
+                          onChange={(e) => setCustomWidth(Math.max(128, Number(e.target.value) || 1920))}
+                          className="w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-1 text-zinc-200"
+                        />
+                      </label>
+                      <label className="flex items-center gap-1.5 text-[10px] font-mono text-zinc-400">
+                        <span>H</span>
+                        <input
+                          type="number"
+                          min={128}
+                          max={7680}
+                          step={2}
+                          value={customHeight}
+                          onChange={(e) => setCustomHeight(Math.max(128, Number(e.target.value) || 1080))}
+                          className="w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-1 text-zinc-200"
+                        />
+                      </label>
+                    </div>
+                  )}
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="text-[11px] font-semibold text-zinc-400 block mb-1.5">
+                      Frame Rate
+                    </label>
+                    <div className="grid grid-cols-3 gap-1">
+                      {[24, 30, 60].map((f) => (
+                        <button
+                          key={f}
+                          type="button"
+                          onClick={() => setFps(f)}
+                          className={`py-1.5 px-1 rounded text-[11px] font-mono font-medium border text-center transition-all cursor-pointer ${
+                            fps === f
+                              ? 'border-blue-500 bg-blue-950/60 text-blue-200'
+                              : 'border-zinc-800 bg-zinc-950 text-zinc-400 hover:text-zinc-200'
+                          }`}
+                        >
+                          {f}fps
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="text-[11px] font-semibold text-zinc-400 block mb-1.5">
+                      Encoder Speed
+                    </label>
+                    <div className="grid grid-cols-3 gap-1">
+                      {(['slow', 'medium', 'fast'] as const).map((sp) => (
+                        <button
+                          key={sp}
+                          type="button"
+                          onClick={() => setEncoderSpeed(sp)}
+                          className={`py-1.5 px-1 rounded text-[11px] font-mono font-medium border text-center capitalize transition-all cursor-pointer ${
+                            encoderSpeed === sp
+                              ? 'border-blue-500 bg-blue-950/60 text-blue-200'
+                              : 'border-zinc-800 bg-zinc-950 text-zinc-400 hover:text-zinc-200'
+                          }`}
+                        >
+                          {sp}
+                        </button>
+                      ))}
+                    </div>
                   </div>
                 </div>
 
-                <div>
-                  <label className="text-[11px] font-semibold text-zinc-400 block mb-1.5">
-                    Frame Rate (Default 30fps)
-                  </label>
-                  <div className="grid grid-cols-2 gap-1.5">
-                    {[30, 60].map((f) => (
-                      <button
-                        key={f}
-                        type="button"
-                        onClick={() => setFps(f)}
-                        className={`py-1.5 px-2 rounded text-xs font-mono font-medium border text-center transition-all cursor-pointer ${
-                          fps === f
-                            ? 'border-blue-500 bg-blue-950/60 text-blue-200'
-                            : 'border-zinc-800 bg-zinc-950 text-zinc-400 hover:text-zinc-200'
-                        }`}
-                      >
-                        {f} FPS
-                      </button>
-                    ))}
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="text-[11px] font-semibold text-zinc-400 block mb-1">
+                      Codec Preset
+                    </label>
+                    <select
+                      value={codecProfile}
+                      onChange={(e) => setCodecProfile(e.target.value as CodecProfileId)}
+                      className="w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-1.5 text-[11px] text-zinc-200 font-mono"
+                    >
+                      {CODEC_PRESETS.filter(
+                        (p) => !p.requiresGpu || capabilities?.h264_nvenc,
+                      ).map((preset) => (
+                        <option key={preset.id} value={preset.id}>
+                          {preset.label}
+                        </option>
+                      ))}
+                    </select>
                   </div>
+
+                  <div>
+                    <label className="text-[11px] font-semibold text-zinc-400 block mb-1">
+                      Quality / CRF Tier
+                    </label>
+                    <select
+                      value={qualityTier}
+                      onChange={(e) => setQualityTier(e.target.value as QualityTier)}
+                      disabled={codecProfile.startsWith('prores')}
+                      className="w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-1.5 text-[11px] text-zinc-200 font-mono disabled:opacity-50"
+                    >
+                      {(Object.keys(QUALITY_TIER_META) as QualityTier[]).map((tier) => (
+                        <option key={tier} value={tier}>
+                          {QUALITY_TIER_META[tier].label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-between pt-0.5 text-[10px] text-zinc-400">
+                  <span>{codecMeta.description}</span>
+                  <label className="flex items-center gap-1.5 cursor-pointer text-zinc-300 shrink-0">
+                    <input
+                      type="checkbox"
+                      checked={verifyAfterExport}
+                      onChange={(e) => setVerifyAfterExport(e.target.checked)}
+                      className="accent-blue-500"
+                    />
+                    <span>FFprobe Verify</span>
+                  </label>
                 </div>
               </div>
 
@@ -1071,6 +1303,44 @@ export function ExportModal({ isOpen, onClose }: ExportModalProps) {
                     </div>
                   )}
 
+                  {validationReport && (
+                    <div className="p-2.5 rounded bg-emerald-950/25 border border-emerald-800/50 text-[10px] font-mono text-zinc-300 grid grid-cols-2 gap-x-3 gap-y-1">
+                      <div>
+                        <span className="text-zinc-500">Stream:</span>{' '}
+                        <span className="text-emerald-300">
+                          {validationReport.width}×{validationReport.height} · {validationReport.codec_name || codecMeta.id}
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-zinc-500">Format / Color:</span>{' '}
+                        <span className="text-emerald-300">
+                          {validationReport.pix_fmt} · {validationReport.color_space || 'bt709'}
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-zinc-500">Cadence:</span>{' '}
+                        <span>
+                          {(validationReport.fps || fps).toFixed(2)}fps ({validationReport.nb_frames || '-'} frames)
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-zinc-500">Bitrate / Sync:</span>{' '}
+                        <span>
+                          {validationReport.bit_rate
+                            ? `${(validationReport.bit_rate / 1_000_000).toFixed(1)} Mbps`
+                            : 'VBR'}{' '}
+                          (Δ {(validationReport.audio_sync_delta_sec ?? 0).toFixed(3)}s)
+                        </span>
+                      </div>
+                      {(validationReport.ssim_avg != null || validationReport.psnr_avg != null) && (
+                        <div className="col-span-2 text-cyan-300">
+                          Quality vs Source — SSIM: {validationReport.ssim_avg?.toFixed(4) ?? '-'} · PSNR:{' '}
+                          {validationReport.psnr_avg?.toFixed(2) ?? '-'} dB
+                        </div>
+                      )}
+                    </div>
+                  )}
+
                   {ffmpegCommand && (
                     <div className="space-y-1.5">
                       <div className="flex items-center justify-between text-[10px] text-zinc-400 font-mono">
@@ -1099,7 +1369,7 @@ export function ExportModal({ isOpen, onClose }: ExportModalProps) {
 
         <div className="pt-3 border-t border-zinc-800/80 flex items-center justify-between">
           <Badge variant="outline" className="text-[10px] font-mono border-zinc-800 text-zinc-400">
-            {resolution} · {fps} FPS · CFR
+            {resolvedDims.width}×{resolvedDims.height} · {fps} FPS · {codecMeta.pixFmt}
           </Badge>
 
           <div className="flex items-center gap-2">
@@ -1109,6 +1379,9 @@ export function ExportModal({ isOpen, onClose }: ExportModalProps) {
                 size="sm"
                 onClick={() => {
                   cancelFlagRef.current = true;
+                  if (isTauriRuntime()) {
+                    invoke('cancel_ffmpeg_export').catch(() => {});
+                  }
                   setExportState('idle');
                   setProgress(0);
                 }}

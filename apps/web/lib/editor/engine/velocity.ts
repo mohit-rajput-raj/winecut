@@ -218,3 +218,38 @@ export function evaluateClipSpeedAtTime(clip: TimelineClip, timelineLocalSec: nu
   const srcOffset = mapTimelineToSourceOffset(clip, timelineLocalSec);
   return evaluateSpeedAtNorm(clip.speedCurve, clamp(srcOffset / sourceSpan, 0, 1));
 }
+
+/**
+ * Generates an FFmpeg `setpts` expression matching piecewise velocity ramps over `sourceSpan` -> `clip.duration`.
+ * Returns `null` when speed is flat across the clip so simple `(PTS-STARTPTS)/rate` can be used.
+ */
+export function buildFFmpegSpeedSetptsExpr(clip: TimelineClip): string | null {
+  if (!clip.speedCurve || clip.speedCurve.points.length < 2) return null;
+  const speeds = clip.speedCurve.points.map((p) => p.speed);
+  const allEqual = speeds.every((s) => Math.abs(s - speeds[0]!) < 0.02);
+  if (allEqual) return null;
+
+  const segments = 8;
+  const lut = buildSpeedLookupTable(clip.speedCurve, segments);
+  const sourceSpan = Math.max(0.05, (clip.sourceEnd ?? clip.duration) - (clip.sourceStart ?? 0));
+  const outDur = Math.max(0.05, clip.duration);
+
+  // Build nested FFmpeg `if(lt(S, end_i), ...)` using source seconds `S = (PTS-STARTPTS)*TB`
+  let expr = outDur.toFixed(5);
+  for (let i = segments - 1; i >= 0; i--) {
+    const s0 = (i / segments) * sourceSpan;
+    const s1 = ((i + 1) / segments) * sourceSpan;
+    const t0 = (lut.timelineFractionAtSource[i] ?? 0) * outDur;
+    const t1 = (lut.timelineFractionAtSource[i + 1] ?? 1) * outDur;
+    const segLen = Math.max(1e-5, s1 - s0);
+    const slope = ((t1 - t0) / segLen).toFixed(5);
+    const segExpr = `${t0.toFixed(5)}+((PTS-STARTPTS)*TB-${s0.toFixed(5)})*${slope}`;
+    if (i === segments - 1) {
+      expr = segExpr;
+    } else {
+      expr = `if(lt((PTS-STARTPTS)*TB,${s1.toFixed(5)}),${segExpr},${expr})`;
+    }
+  }
+
+  return `(${expr})/TB`;
+}
