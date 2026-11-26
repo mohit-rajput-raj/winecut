@@ -1,9 +1,16 @@
 'use client';
+/* eslint-disable @next/next/no-img-element */
 
 import React, { useState, useRef } from 'react';
 import { useEditor } from '../../lib/editor/EditorContext';
 import { MediaAsset } from '../../lib/editor/types';
 import { AVAILABLE_SKILLS } from '../../lib/editor/sample-data';
+import {
+  EFFECT_BUNDLES,
+  FILTER_PRESETS,
+  STICKER_PACKS,
+  TEXT_STYLE_TEMPLATES,
+} from '../../lib/editor/presets/bundles';
 import { Badge } from '../ui/badge';
 import { Button } from '../ui/button';
 import { 
@@ -11,24 +18,30 @@ import {
   Type, 
   Music, 
   Sparkles, 
-  Film, 
   Plus, 
   Sliders, 
   Check, 
   Zap, 
   Upload, 
   FileVideo,
-  FileAudio
+  FileAudio,
+  Smile,
+  GripVertical
 } from 'lucide-react';
 
 export function EditorSidebar() {
   const { 
     project, 
+    selectedClip,
     activeSidebarTab, 
     setActiveSidebarTab, 
     addClipToTrack, 
     autoAddMediaToTimeline,
     addTextClip,
+    addRichTextClip,
+    addStickerClip,
+    applyClipFilterPreset,
+    toggleClipLayerEffect,
     applySkill,
     importMediaAsset 
   } = useEditor();
@@ -41,10 +54,24 @@ export function EditorSidebar() {
   const tabs = [
     { id: 'media' as const, label: 'Media', icon: FolderPlus },
     { id: 'text' as const, label: 'Text', icon: Type },
+    { id: 'stickers' as const, label: 'Stickers', icon: Smile },
     { id: 'audio' as const, label: 'Audio', icon: Music },
-    { id: 'effects' as const, label: 'Effects', icon: Sliders },
+    { id: 'effects' as const, label: 'FX & LUTs', icon: Sliders },
     { id: 'skills' as const, label: 'AI Skills', icon: Sparkles },
   ];
+
+  const resolveTargetVisualClipId = (): string | null => {
+    if (selectedClip && (selectedClip.type === 'video' || selectedClip.type === 'image' || selectedClip.type === 'sticker')) {
+      return selectedClip.id;
+    }
+    const v1 = project.timeline.tracks.find((t) => t.id === 'track-v1') || project.timeline.tracks.find((t) => t.type === 'video');
+    return v1?.clips[0]?.id ?? null;
+  };
+
+  const handleDragStartPayload = (e: React.DragEvent, payload: Record<string, unknown>) => {
+    e.dataTransfer.setData('application/x-winecut-drag', JSON.stringify(payload));
+    e.dataTransfer.effectAllowed = 'copy';
+  };
 
   const handleRunSkill = (id: string) => {
     applySkill(id);
@@ -65,56 +92,72 @@ export function EditorSidebar() {
       const blobUrl = URL.createObjectURL(file);
 
       if (isVideo) {
-        // Extract real video metadata & canvas thumbnail
+        // Extract real video metadata & canvas thumbnail (non-blocking for large >34s+ media)
         const video = document.createElement('video');
-        video.src = blobUrl;
+        video.preload = 'metadata';
         video.muted = true;
         video.playsInline = true;
+        video.src = blobUrl;
 
         await new Promise<void>((resolve) => {
-          video.onloadeddata = () => {
-            video.currentTime = Math.min(1.0, (video.duration || 2) / 2);
-          };
-          video.onseeked = () => {
-            const canvas = document.createElement('canvas');
-            canvas.width = 160;
-            canvas.height = 90;
-            const ctx = canvas.getContext('2d');
-            if (ctx) {
-              ctx.drawImage(video, 0, 0, 160, 90);
-              const thumbUrl = canvas.toDataURL('image/jpeg', 0.8);
-
-              const newAsset: MediaAsset = {
-                id: `asset-user-${Date.now()}-${i}`,
-                name: file.name,
-                type: 'video',
-                url: blobUrl,
-                thumbnailUrl: thumbUrl,
-                duration: Math.round(video.duration || 10),
-                width: video.videoWidth || 1920,
-                height: video.videoHeight || 1080,
-                fps: 30,
-                mimeType: file.type || 'video/mp4',
-              };
-              importMediaAsset(newAsset, file);
-            }
-            resolve();
-          };
-          video.onerror = () => {
-            // Fallback if video codec cannot render in preview
+          let settled = false;
+          const finish = (thumbUrl?: string) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(safetyTimer);
+            const rawDur =
+              Number.isFinite(video.duration) && video.duration > 0
+                ? Number(video.duration.toFixed(2))
+                : 10;
             const newAsset: MediaAsset = {
               id: `asset-user-${Date.now()}-${i}`,
               name: file.name,
               type: 'video',
               url: blobUrl,
-              duration: 10,
-              width: 1920,
-              height: 1080,
+              thumbnailUrl: thumbUrl,
+              duration: Math.max(0.5, rawDur),
+              width: video.videoWidth || 1920,
+              height: video.videoHeight || 1080,
               fps: 30,
               mimeType: file.type || 'video/mp4',
             };
             importMediaAsset(newAsset, file);
             resolve();
+          };
+
+          const safetyTimer = setTimeout(() => {
+            // Even if seeking stalls on a large/long video, import with full detected metadata duration
+            finish(undefined);
+          }, 3000);
+
+          video.onloadedmetadata = () => {
+            const seekPos = Math.min(1.0, Math.max(0.05, (video.duration || 2) * 0.1));
+            try {
+              video.currentTime = seekPos;
+            } catch {
+              finish(undefined);
+            }
+          };
+
+          video.onseeked = () => {
+            try {
+              const canvas = document.createElement('canvas');
+              canvas.width = 160;
+              canvas.height = 90;
+              const ctx = canvas.getContext('2d');
+              if (ctx && video.videoWidth > 0) {
+                ctx.drawImage(video, 0, 0, 160, 90);
+                finish(canvas.toDataURL('image/jpeg', 0.8));
+                return;
+              }
+            } catch {
+              // ignore thumbnail capture failures and still import full duration
+            }
+            finish(undefined);
+          };
+
+          video.onerror = () => {
+            finish(undefined);
           };
         });
       } else if (isAudio) {
@@ -269,7 +312,9 @@ export function EditorSidebar() {
               {project.mediaLibrary.map((asset) => (
                 <div
                   key={asset.id}
-                  className="group relative rounded-md border border-zinc-800 bg-zinc-900/60 p-2 hover:bg-zinc-800/60 transition-all flex flex-col gap-1.5 min-w-0"
+                  draggable
+                  onDragStart={(e) => handleDragStartPayload(e, { kind: 'media', assetId: asset.id })}
+                  className="group relative rounded-md border border-zinc-800 bg-zinc-900/60 p-2 hover:bg-zinc-800/60 transition-all flex flex-col gap-1.5 min-w-0 cursor-grab active:cursor-grabbing"
                 >
                   <div className="w-full h-20 rounded bg-zinc-950 flex items-center justify-center relative overflow-hidden border border-zinc-800/80">
                     {asset.thumbnailUrl ? (
@@ -355,69 +400,99 @@ export function EditorSidebar() {
           </div>
         )}
 
-        {/* Text Presets Tab */}
+        {/* Text Presets Tab (Click or Drag & Drop onto Monitor / Timeline) */}
         {activeSidebarTab === 'text' && (
           <div className="space-y-3 min-w-0">
             <div className="flex items-center justify-between pb-1">
               <span className="text-xs font-semibold text-zinc-300 uppercase tracking-wider">
-                Typography & Subtitles
+                Typography &amp; Captions
               </span>
               <Badge variant="outline" className="text-[10px] font-mono border-zinc-800 text-zinc-400">
-                Overlay
+                Drag to Canvas
               </Badge>
             </div>
 
             <div className="space-y-2">
-              <div 
-                onClick={() => addTextClip('HEADLINE TITLE')}
-                className="group p-3 rounded-md border border-zinc-800 bg-zinc-900/60 hover:bg-zinc-800/60 transition-all cursor-pointer flex items-center justify-between"
-              >
-                <div>
-                  <div className="text-sm font-bold text-zinc-100 group-hover:text-white">
-                    Minimal Headline
+              {TEXT_STYLE_TEMPLATES.map((tpl) => (
+                <div
+                  key={tpl.id}
+                  draggable
+                  onDragStart={(e) => handleDragStartPayload(e, { kind: 'text-template', templateId: tpl.id })}
+                  onClick={() => addRichTextClip(tpl)}
+                  className="group p-2.5 rounded-md border border-zinc-800 bg-zinc-900/60 hover:bg-zinc-800/70 transition-all cursor-grab active:cursor-grabbing flex items-center justify-between gap-2"
+                >
+                  <div className="min-w-0 flex-1 space-y-1">
+                    <div className="flex items-center gap-1.5">
+                      <GripVertical className="w-3 h-3 text-zinc-600 shrink-0" />
+                      <span className="text-[10px] font-mono text-zinc-400 truncate">{tpl.label}</span>
+                    </div>
+                    <div
+                      className="inline-block px-2 py-0.5 text-xs truncate max-w-full"
+                      style={{
+                        color: tpl.gradientColors ? 'transparent' : tpl.textColor,
+                        backgroundImage: tpl.gradientColors
+                          ? `linear-gradient(90deg, ${tpl.gradientColors[0]}, ${tpl.gradientColors[1]})`
+                          : undefined,
+                        WebkitBackgroundClip: tpl.gradientColors ? 'text' : undefined,
+                        backgroundColor: !tpl.gradientColors ? tpl.textBgColor : undefined,
+                        borderRadius: tpl.bgRadius ? `${Math.min(8, tpl.bgRadius)}px` : undefined,
+                        fontWeight: tpl.fontWeight,
+                        WebkitTextStroke: tpl.strokeWidth ? `1px ${tpl.strokeColor || '#000'}` : undefined,
+                      }}
+                    >
+                      {tpl.previewText}
+                    </div>
                   </div>
-                  <div className="text-[10px] text-zinc-400 font-mono mt-0.5">
-                    Bold Display 48px · Center
-                  </div>
+                  <Button size="icon" variant="ghost" className="h-6 w-6 text-zinc-400 group-hover:text-zinc-100 shrink-0">
+                    <Plus className="w-3.5 h-3.5" />
+                  </Button>
                 </div>
-                <Button size="icon" variant="ghost" className="h-6 w-6 text-zinc-400 group-hover:text-zinc-100">
-                  <Plus className="w-3.5 h-3.5" />
-                </Button>
-              </div>
+              ))}
 
-              <div 
-                onClick={() => addTextClip('Captivating viral subtitle caption')}
-                className="group p-3 rounded-md border border-zinc-800 bg-zinc-900/60 hover:bg-zinc-800/60 transition-all cursor-pointer flex items-center justify-between"
+              <button
+                type="button"
+                onClick={() => addTextClip('CUSTOM CAPTION')}
+                className="w-full py-1.5 rounded-md border border-dashed border-zinc-800 text-[11px] text-zinc-400 hover:text-zinc-200 hover:border-zinc-700 cursor-pointer"
               >
-                <div>
-                  <div className="text-sm font-medium text-amber-300 group-hover:text-amber-200">
-                    Animated Captions
-                  </div>
-                  <div className="text-[10px] text-zinc-400 font-mono mt-0.5">
-                    Karaoke highlight · TikTok safe
-                  </div>
-                </div>
-                <Button size="icon" variant="ghost" className="h-6 w-6 text-zinc-400 group-hover:text-zinc-100">
-                  <Plus className="w-3.5 h-3.5" />
-                </Button>
-              </div>
+                + Plain Caption Clip
+              </button>
+            </div>
+          </div>
+        )}
 
-              <div 
-                onClick={() => addTextClip('LOWER THIRD CALLOUT')}
-                className="group p-3 rounded-md border border-zinc-800 bg-zinc-900/60 hover:bg-zinc-800/60 transition-all cursor-pointer flex items-center justify-between"
-              >
-                <div>
-                  <div className="text-sm font-semibold text-zinc-200">
-                    Broadcast Lower Third
+        {/* Stickers Tab (Click or Drag & Drop onto Monitor / Timeline) */}
+        {activeSidebarTab === 'stickers' && (
+          <div className="space-y-3 min-w-0">
+            <div className="flex items-center justify-between pb-1">
+              <span className="text-xs font-semibold text-zinc-300 uppercase tracking-wider">
+                Stickers &amp; Callouts
+              </span>
+              <Badge variant="outline" className="text-[10px] font-mono border-zinc-800 text-zinc-400">
+                Drag to Canvas
+              </Badge>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2">
+              {STICKER_PACKS.map((sticker) => (
+                <div
+                  key={sticker.id}
+                  draggable
+                  onDragStart={(e) => handleDragStartPayload(e, { kind: 'sticker', stickerId: sticker.id })}
+                  onClick={() => addStickerClip(sticker)}
+                  className="group p-2 rounded-md border border-zinc-800 bg-zinc-900/60 hover:bg-zinc-800/70 transition-all cursor-grab active:cursor-grabbing flex flex-col items-center gap-1.5"
+                >
+                  <div className="h-12 w-full flex items-center justify-center rounded bg-zinc-950/80 p-1.5">
+                    <img
+                      src={`data:image/svg+xml;utf8,${encodeURIComponent(sticker.svg)}`}
+                      alt={sticker.label}
+                      className="max-h-full max-w-full object-contain pointer-events-none"
+                    />
                   </div>
-                  <div className="text-[10px] text-zinc-400 font-mono mt-0.5">
-                    News style · Bottom Left
-                  </div>
+                  <span className="text-[10px] text-zinc-300 truncate w-full text-center">
+                    {sticker.label}
+                  </span>
                 </div>
-                <Button size="icon" variant="ghost" className="h-6 w-6 text-zinc-400 group-hover:text-zinc-100">
-                  <Plus className="w-3.5 h-3.5" />
-                </Button>
-              </div>
+              ))}
             </div>
           </div>
         )}
@@ -480,32 +555,84 @@ export function EditorSidebar() {
           </div>
         )}
 
-        {/* Effects & Filters Tab */}
+        {/* Effects & Color Filters Tab */}
         {activeSidebarTab === 'effects' && (
-          <div className="space-y-3 min-w-0">
-            <div className="flex items-center justify-between pb-1">
-              <span className="text-xs font-semibold text-zinc-300 uppercase tracking-wider">
-                Real-Time Video FX
-              </span>
-              <Badge variant="outline" className="text-[10px] font-mono border-zinc-800 text-zinc-400">
-                GPU Fast
-              </Badge>
+          <div className="space-y-4 min-w-0">
+            <div className="space-y-2">
+              <div className="flex items-center justify-between pb-0.5">
+                <span className="text-xs font-semibold text-zinc-300 uppercase tracking-wider">
+                  Color Filter Presets
+                </span>
+                <Badge variant="outline" className="text-[10px] font-mono border-zinc-800 text-zinc-400">
+                  WebGL2
+                </Badge>
+              </div>
+              <div className="grid grid-cols-2 gap-1.5">
+                {FILTER_PRESETS.map((preset) => {
+                  const targetId = resolveTargetVisualClipId();
+                  const isActive = Boolean(
+                    selectedClip &&
+                      ((selectedClip.lutId || 'none') === preset.id)
+                  );
+                  return (
+                    <button
+                      key={preset.id}
+                      type="button"
+                      draggable
+                      onDragStart={(e) => handleDragStartPayload(e, { kind: 'filter-preset', lutId: preset.id })}
+                      onClick={() => {
+                        if (targetId) applyClipFilterPreset(targetId, preset.id);
+                      }}
+                      className={`p-2 rounded-md border text-left transition-all cursor-pointer ${
+                        isActive
+                          ? 'border-blue-500 bg-blue-950/40'
+                          : 'border-zinc-800 bg-zinc-900/60 hover:bg-zinc-800/60'
+                      }`}
+                    >
+                      <div
+                        className="h-4 w-full rounded-sm mb-1.5"
+                        style={{ background: preset.swatch }}
+                      />
+                      <div className="text-[11px] font-medium text-zinc-200 truncate">{preset.label}</div>
+                      <div className="text-[9px] text-zinc-500 font-mono">{preset.category}</div>
+                    </button>
+                  );
+                })}
+              </div>
             </div>
 
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 min-w-0">
-              <div 
-                onClick={() => applySkill('lut-cinematic')}
-                className="p-3 rounded-md border border-zinc-800 bg-zinc-900/60 hover:bg-zinc-800/60 transition-all cursor-pointer"
-              >
-                <div className="text-xs font-medium text-zinc-200">Teal & Orange</div>
-                <div className="text-[10px] text-zinc-400 mt-1">Blockbuster LUT</div>
+            <div className="space-y-2 pt-2 border-t border-zinc-800/80">
+              <div className="flex items-center justify-between pb-0.5">
+                <span className="text-xs font-semibold text-zinc-300 uppercase tracking-wider">
+                  Shader FX Bundles
+                </span>
+                <span className="text-[10px] font-mono text-zinc-500">Click or Drop</span>
               </div>
-              <div 
-                onClick={() => applySkill('lut-cinematic')}
-                className="p-3 rounded-md border border-zinc-800 bg-zinc-900/60 hover:bg-zinc-800/60 transition-all cursor-pointer"
-              >
-                <div className="text-xs font-medium text-zinc-200">Noir Contrast</div>
-                <div className="text-[10px] text-zinc-400 mt-1">Monochrome high punch</div>
+              <div className="grid grid-cols-2 gap-1.5">
+                {EFFECT_BUNDLES.map((fx) => {
+                  const targetId = resolveTargetVisualClipId();
+                  const isActive = Boolean(selectedClip?.layerEffects?.includes(fx.id));
+                  return (
+                    <button
+                      key={fx.id}
+                      type="button"
+                      draggable
+                      onDragStart={(e) => handleDragStartPayload(e, { kind: 'layer-effect', effectId: fx.id })}
+                      onClick={() => {
+                        if (targetId) toggleClipLayerEffect(targetId, fx.id);
+                      }}
+                      className={`p-2 rounded-md border text-left transition-all cursor-pointer ${
+                        isActive
+                          ? 'border-teal-500 bg-teal-950/40 text-teal-200'
+                          : 'border-zinc-800 bg-zinc-900/60 hover:bg-zinc-800/60 text-zinc-200'
+                      }`}
+                      title={fx.description}
+                    >
+                      <div className="text-[11px] font-semibold truncate">{fx.label}</div>
+                      <div className="text-[9px] text-zinc-400 font-mono">{fx.category}</div>
+                    </button>
+                  );
+                })}
               </div>
             </div>
           </div>

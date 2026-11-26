@@ -1,9 +1,10 @@
 'use client';
 
+/* eslint-disable @next/next/no-img-element */
 import React, { useRef, useState, useEffect, useMemo, useCallback } from 'react';
 import { useEditor } from '../../lib/editor/EditorContext';
 import { secondsToTimecode } from '../../lib/editor/time-utils';
-import { buildCssFilter, buildMasterFilter } from '../../lib/editor/render-utils';
+import { buildMasterFilter } from '../../lib/editor/render-utils';
 import {
   computeClipBoundingBox,
   solveCanvasSnap,
@@ -12,6 +13,21 @@ import {
   CanvasBoundingBox,
 } from '../../lib/editor/canvas-layout';
 import { TimelineClip, Track, MediaAsset } from '../../lib/editor/types';
+import { WebGLMediaLayer, TransitionLayerOverride } from './WebGLMediaLayer';
+import { evaluateClipMotion } from '../../lib/editor/engine/animations';
+import {
+  evaluateClipSpeedAtTime,
+  mapTimelineToSourceOffset,
+} from '../../lib/editor/engine/velocity';
+import {
+  findActiveTransitionAtTime,
+  getTransitionVisualPair,
+} from '../../lib/editor/engine/transitions';
+import {
+  FILTER_PRESETS,
+  STICKER_PACKS,
+  TEXT_STYLE_TEMPLATES,
+} from '../../lib/editor/presets/bundles';
 import { Badge } from '../ui/badge';
 import { Button } from '../ui/button';
 import {
@@ -65,15 +81,25 @@ function AudioTrackPlayer({
     const audio = audioRef.current;
     if (!audio) return;
 
-    const clipOffset = currentTime - clip.timelineStart + clip.sourceStart;
+    const localTime = Math.max(0, currentTime - clip.timelineStart);
+    const clipOffset = (clip.sourceStart || 0) + mapTimelineToSourceOffset(clip, localTime);
     if (Math.abs(audio.currentTime - clipOffset) > 0.15) {
       audio.currentTime = Math.max(0, clipOffset);
     }
 
-    audio.playbackRate = playbackRate;
+    const instSpeed = evaluateClipSpeedAtTime(clip, localTime);
+    audio.playbackRate = Math.max(0.1, Math.min(8.0, playbackRate * instSpeed));
+
+    let fadeMul = 1;
+    if (clip.fadeIn > 0 && localTime < clip.fadeIn) {
+      fadeMul *= Math.max(0, localTime / clip.fadeIn);
+    }
+    if (clip.fadeOut > 0 && localTime > clip.duration - clip.fadeOut) {
+      fadeMul *= Math.max(0, (clip.duration - localTime) / clip.fadeOut);
+    }
 
     const clipVol = (clip.volume ?? 100) / 100;
-    const finalVol = Math.max(0, Math.min(1, (masterVolume / 100) * clipVol));
+    const finalVol = Math.max(0, Math.min(1, (masterVolume / 100) * clipVol * fadeMul));
     audio.volume = finalVol;
     audio.muted = isMasterMuted || trackMuted || clip.muted || finalVol === 0;
 
@@ -87,89 +113,17 @@ function AudioTrackPlayer({
   return <audio ref={audioRef} src={assetUrl} preload="auto" className="hidden" />;
 }
 
-// Synchronized Video Layer Component with Click-to-Select Support
-function VideoLayerPlayer({
-  clip,
-  track,
-  assetUrl,
-  currentTime,
-  isPlaying,
-  playbackRate,
-  masterVolume,
-  isMasterMuted,
-  zIndex,
-  isSelected,
-}: {
-  clip: TimelineClip;
-  track: Track;
-  assetUrl: string;
-  currentTime: number;
-  isPlaying: boolean;
-  playbackRate: number;
-  masterVolume: number;
-  isMasterMuted: boolean;
-  zIndex: number;
-  isSelected: boolean;
-}) {
-  const videoRef = useRef<HTMLVideoElement>(null);
-
-  useEffect(() => {
-    const video = videoRef.current;
-    if (!video) return;
-
-    const clipOffset = currentTime - clip.timelineStart + clip.sourceStart;
-    if (Math.abs(video.currentTime - clipOffset) > 0.15) {
-      video.currentTime = Math.max(0, clipOffset);
-    }
-
-    video.playbackRate = playbackRate;
-
-    const clipVol = (clip.volume ?? 100) / 100;
-    const finalVol = Math.max(0, Math.min(1, (masterVolume / 100) * clipVol));
-    video.volume = finalVol;
-    video.muted = isMasterMuted || track.muted || clip.muted || finalVol === 0;
-
-    if (isPlaying && video.paused) {
-      video.play().catch(() => {});
-    } else if (!isPlaying && !video.paused) {
-      video.pause();
-    }
-  }, [currentTime, isPlaying, clip, track.muted, playbackRate, masterVolume, isMasterMuted]);
-
-  const filterString = buildCssFilter(clip.effects);
-
-  return (
-    <div
-      className="absolute inset-0 flex items-center justify-center pointer-events-none"
-      style={{
-        zIndex,
-        transform: `translate(${clip.transform.x}px, ${clip.transform.y}px) scale(${clip.transform.scale}) rotate(${clip.transform.rotation}deg)`,
-        opacity: clip.transform.opacity ?? 1,
-        filter: filterString,
-      }}
-    >
-      <video
-        ref={videoRef}
-        src={assetUrl}
-        data-clip-id={clip.id}
-        className={`w-full h-full object-cover pointer-events-auto cursor-pointer transition-shadow ${
-          !isSelected ? 'hover:outline hover:outline-2 hover:outline-blue-400/50 hover:-outline-offset-2' : ''
-        }`}
-        playsInline
-      />
-    </div>
-  );
-}
-
 // Interactive Transform Wireframe Gizmo for Selected Clip in Video Window
 // Interior allows click-through for top layers via stage hit-testing, while handles stay directly interactive.
 function WireframeGizmo({
   clip,
+  stageScale = 1,
   onTransformChange,
   onInteractionStart,
   onInteractionEnd,
 }: {
   clip: TimelineClip;
+  stageScale?: number;
   onTransformChange: (updates: Partial<{ x: number; y: number; scale: number; rotation: number }>) => void;
   onInteractionStart?: (label?: string) => void;
   onInteractionEnd?: () => void;
@@ -203,7 +157,7 @@ function WireframeGizmo({
       const deltaY = e.clientY - dragStartRef.current.mouseY;
 
       if (isDragging === 'scale') {
-        const factor = 1 + (deltaX - deltaY) / 300;
+        const factor = 1 + (deltaX - deltaY) / Math.max(120, 300 * stageScale);
         const newScale = Math.max(0.1, Math.min(3.0, Number((dragStartRef.current.startScale * factor).toFixed(2))));
         onTransformChange({ scale: newScale });
       } else if (isDragging === 'rotate') {
@@ -223,7 +177,7 @@ function WireframeGizmo({
       window.removeEventListener('mousemove', handleMouseMove);
       window.removeEventListener('mouseup', handleMouseUp);
     };
-  }, [isDragging, onTransformChange, onInteractionEnd]);
+  }, [isDragging, stageScale, onTransformChange, onInteractionEnd]);
 
   const scale = clip.transform.scale || 1;
   const rotation = clip.transform.rotation || 0;
@@ -312,6 +266,11 @@ export function VideoPreviewCanvas() {
     selectedClip,
     selectClip,
     updateClipTransform,
+    addClipToTrack,
+    addRichTextClip,
+    addStickerClip,
+    applyClipFilterPreset,
+    toggleClipLayerEffect,
     alignClipInCanvas,
     autoArrangeCanvasLayers,
     playbackRate,
@@ -400,18 +359,80 @@ export function VideoPreviewCanvas() {
     }
   }, [stageSize, targetAspect]);
 
-  // 1. Gather all active visual layers bottom-to-top: tracks higher on timeline render on top!
+  // Fixed logical stage dimensions aligned with ExportModal/ffmpeg-export (680x382 for 16:9)
+  // so resizing or shrinking the monitor window never shifts stickers, text, or overlays.
+  const canonicalDimensions = useMemo(() => {
+    const CANONICAL_H = 382;
+    if (aspectRatio === '16:9') return { width: 680, height: CANONICAL_H };
+    return {
+      width: Math.max(180, Math.round(CANONICAL_H * targetAspect)),
+      height: CANONICAL_H,
+    };
+  }, [aspectRatio, targetAspect]);
+
+  const totalStageScale = Math.max(
+    0.15,
+    (monitorDimensions.height / canonicalDimensions.height) * viewportZoom,
+  );
+
+  // 1. Gather all active visual layers + active seam transitions bottom-to-top
   interface VisualLayer {
     track: Track;
     clip: TimelineClip;
     asset: MediaAsset | undefined;
+    transitionOverride?: TransitionLayerOverride;
   }
 
-  const activeVisualLayers: VisualLayer[] = useMemo(() => {
+  const { activeVisualLayers, activeFlashAlpha } = useMemo(() => {
     const videoTracks = project.timeline.tracks.filter(t => t.type === 'video' && t.visible);
     const bottomToTopVideoTracks = [...videoTracks].reverse();
     const layers: VisualLayer[] = [];
+    let flashPeak = 0;
+
     for (const track of bottomToTopVideoTracks) {
+      const activeTr = findActiveTransitionAtTime(
+        track,
+        project.timeline.transitions || [],
+        currentTime,
+      );
+
+      if (activeTr) {
+        const pair = getTransitionVisualPair(
+          activeTr.edge.type,
+          activeTr.progress,
+          canonicalDimensions.width,
+          canonicalDimensions.height,
+        );
+        if (pair.flashAlpha > flashPeak) flashPeak = pair.flashAlpha;
+
+        layers.push({
+          track,
+          clip: activeTr.fromClip,
+          asset: project.mediaLibrary.find(a => a.id === activeTr.fromClip.assetId),
+          transitionOverride: {
+            dx: pair.outDx,
+            dy: pair.outDy,
+            scale: pair.outScale,
+            opacity: pair.outOpacity,
+            blur: pair.outBlur,
+          },
+        });
+        layers.push({
+          track,
+          clip: activeTr.toClip,
+          asset: project.mediaLibrary.find(a => a.id === activeTr.toClip.assetId),
+          transitionOverride: {
+            dx: pair.inDx,
+            dy: pair.inDy,
+            scale: pair.inScale,
+            opacity: pair.inOpacity,
+            blur: pair.inBlur,
+            clipPath: pair.inClipPath,
+          },
+        });
+        continue;
+      }
+
       const clip = track.clips.find(
         c => currentTime >= c.timelineStart && currentTime <= c.timelineStart + c.duration
       );
@@ -420,8 +441,8 @@ export function VideoPreviewCanvas() {
         layers.push({ track, clip, asset });
       }
     }
-    return layers;
-  }, [project.timeline.tracks, project.mediaLibrary, currentTime]);
+    return { activeVisualLayers: layers, activeFlashAlpha: flashPeak };
+  }, [project.timeline.tracks, project.timeline.transitions, project.mediaLibrary, currentTime, canonicalDimensions]);
 
   // 2. Gather all active audio clips across audio tracks
   const activeAudioLayers = useMemo(() => {
@@ -478,8 +499,8 @@ export function VideoPreviewCanvas() {
     const startMouseY = e.clientY;
     const startX = targetClip.transform.x || 0;
     const startY = targetClip.transform.y || 0;
-    const monW = monitorDimensions.width;
-    const monH = monitorDimensions.height;
+    const monW = canonicalDimensions.width;
+    const monH = canonicalDimensions.height;
     const isText = targetClip.type === 'text';
     const baseW = isText ? Math.min(monW * 0.55, Math.max(120, (targetClip.textContent?.length || 8) * 10)) : monW;
     const baseH = isText ? 36 : monH;
@@ -498,8 +519,8 @@ export function VideoPreviewCanvas() {
     ];
 
     const onMouseMove = (moveEv: MouseEvent) => {
-      const dx = (moveEv.clientX - startMouseX) / viewportZoom;
-      const dy = (moveEv.clientY - startMouseY) / viewportZoom;
+      const dx = (moveEv.clientX - startMouseX) / totalStageScale;
+      const dy = (moveEv.clientY - startMouseY) / totalStageScale;
       if (Math.abs(dx) > 2 || Math.abs(dy) > 2) {
         const rawX = Math.round(startX + dx);
         const rawY = Math.round(startY + dy);
@@ -547,8 +568,8 @@ export function VideoPreviewCanvas() {
     activeTextClips,
     selectClip,
     updateClipTransform,
-    viewportZoom,
-    monitorDimensions,
+    totalStageScale,
+    canonicalDimensions,
     smartGuidesEnabled,
     beginHistoryTransaction,
     endHistoryTransaction,
@@ -617,14 +638,14 @@ export function VideoPreviewCanvas() {
           {selectedClip && (selectedClip.type === 'video' || selectedClip.type === 'image') && (
             <div className="flex items-center gap-0.5 bg-zinc-900 px-1 py-0.5 rounded border border-zinc-800 mr-1">
               <button
-                onClick={() => alignClipInCanvas(selectedClip.id, 'center-h', monitorDimensions.width, monitorDimensions.height)}
+                onClick={() => alignClipInCanvas(selectedClip.id, 'center-h', canonicalDimensions.width, canonicalDimensions.height)}
                 className="p-1 rounded text-zinc-400 hover:text-white hover:bg-zinc-800 cursor-pointer"
                 title="Center Layer Horizontally"
               >
                 <AlignCenterHorizontal className="w-3 h-3" />
               </button>
               <button
-                onClick={() => alignClipInCanvas(selectedClip.id, 'center-v', monitorDimensions.width, monitorDimensions.height)}
+                onClick={() => alignClipInCanvas(selectedClip.id, 'center-v', canonicalDimensions.width, canonicalDimensions.height)}
                 className="p-1 rounded text-zinc-400 hover:text-white hover:bg-zinc-800 cursor-pointer"
                 title="Center Layer Vertically"
               >
@@ -635,7 +656,7 @@ export function VideoPreviewCanvas() {
 
           {activeVisualLayers.length > 1 && (
             <button
-              onClick={() => autoArrangeCanvasLayers(monitorDimensions.width, monitorDimensions.height, 14, 10)}
+              onClick={() => autoArrangeCanvasLayers(canonicalDimensions.width, canonicalDimensions.height, 14, 10)}
               className="flex items-center gap-1 text-[10px] font-medium px-2 py-0.5 rounded bg-blue-950/60 border border-blue-700/60 text-blue-300 hover:bg-blue-900/70 transition-colors cursor-pointer"
               title="Auto-Layout active layers with uniform padding & spacing"
             >
@@ -721,24 +742,74 @@ export function VideoPreviewCanvas() {
       >
         <div
           onMouseDown={handleMonitorMouseDown}
+          onDragOver={(e) => {
+            if (e.dataTransfer.types.includes('application/x-winecut-drag')) {
+              e.preventDefault();
+              e.dataTransfer.dropEffect = 'copy';
+            }
+          }}
+          onDrop={(e) => {
+            const raw = e.dataTransfer.getData('application/x-winecut-drag');
+            if (!raw) return;
+            e.preventDefault();
+            try {
+              const payload = JSON.parse(raw) as {
+                kind?: string;
+                assetId?: string;
+                templateId?: string;
+                stickerId?: string;
+                lutId?: string;
+                effectId?: string;
+              };
+              const rect = e.currentTarget.getBoundingClientRect();
+              const xOffset = Math.round(((e.clientX - rect.left) - rect.width / 2) / totalStageScale);
+              const yOffset = Math.round(((e.clientY - rect.top) - rect.height / 2) / totalStageScale);
+
+              if (payload.kind === 'text-template' && payload.templateId) {
+                const tpl = TEXT_STYLE_TEMPLATES.find((t) => t.id === payload.templateId);
+                if (tpl) addRichTextClip(tpl, { x: xOffset, y: Math.round(yOffset - canonicalDimensions.height * 0.34) });
+              } else if (payload.kind === 'sticker' && payload.stickerId) {
+                const st = STICKER_PACKS.find((s) => s.id === payload.stickerId);
+                if (st) addStickerClip(st, { x: xOffset, y: yOffset });
+              } else if (payload.kind === 'media' && payload.assetId) {
+                const found = project.mediaLibrary.find((a) => a.id === payload.assetId);
+                if (found) addClipToTrack('track-v2', found);
+              } else if (payload.kind === 'filter-preset' && payload.lutId && selectedClip) {
+                const preset = FILTER_PRESETS.find((f) => f.id === payload.lutId);
+                if (preset) applyClipFilterPreset(selectedClip.id, preset.id);
+              } else if (payload.kind === 'layer-effect' && payload.effectId && selectedClip) {
+                toggleClipLayerEffect(selectedClip.id, payload.effectId);
+              }
+            } catch {
+              // ignore malformed payload
+            }
+          }}
           style={{
-            width: `${monitorDimensions.width}px`,
-            height: `${monitorDimensions.height}px`,
-            transform: `scale(${viewportZoom})`,
-            transformOrigin: 'center center',
+            width: `${Math.max(120, Math.round(monitorDimensions.width * viewportZoom))}px`,
+            height: `${Math.max(68, Math.round(monitorDimensions.height * viewportZoom))}px`,
             filter: masterScreenFilter,
           }}
           className="relative bg-black rounded shadow-[0_4px_35px_rgba(0,0,0,0.8)] border border-zinc-700/80 overflow-hidden flex items-center justify-center select-none"
         >
-          {/* Multi-Track Video & Image Compositing Stack */}
+          {/* Resolution-locked Canonical Stage so shrinking/expanding window keeps stickers & text pixel-accurate */}
+          <div
+            style={{
+              width: `${canonicalDimensions.width}px`,
+              height: `${canonicalDimensions.height}px`,
+              transform: `scale(${totalStageScale})`,
+              transformOrigin: 'center center',
+            }}
+            className="relative shrink-0 overflow-hidden flex items-center justify-center"
+          >
+          {/* Multi-Track WebGL2 Video, Image & Sticker Compositing Stack */}
           {activeVisualLayers.map((layer, index) => {
             const zIndex = (index + 1) * 10;
             const isLayerSelected = selectedClip?.id === layer.clip.id;
 
-            if (layer.clip.type === 'video' && layer.asset?.url) {
+            if ((layer.clip.type === 'video' || layer.clip.type === 'image') && layer.asset?.url) {
               return (
-                <VideoLayerPlayer
-                  key={layer.clip.id}
+                <WebGLMediaLayer
+                  key={`${layer.clip.id}-${index}`}
                   clip={layer.clip}
                   track={layer.track}
                   assetUrl={layer.asset.url}
@@ -749,41 +820,36 @@ export function VideoPreviewCanvas() {
                   isMasterMuted={isMuted}
                   zIndex={zIndex}
                   isSelected={isLayerSelected}
+                  transitionOverride={layer.transitionOverride}
                 />
               );
             }
 
-            if (layer.clip.type === 'image' && layer.asset?.url) {
-              const fitMode = layer.clip.fitMode || 'cover';
-              const borderRadius = layer.clip.borderRadius ?? 0;
-              const borderWidth = layer.clip.borderWidth ?? 0;
-              const borderColor = layer.clip.borderColor || '#ffffff';
-              const dropShadow = layer.clip.dropShadow;
-
+            if (layer.clip.type === 'sticker' && layer.clip.stickerSvg) {
+              const localT = Math.max(0, currentTime - layer.clip.timelineStart);
+              const motion = evaluateClipMotion(layer.clip, localT);
+              const tx = (layer.clip.transform.x || 0) + motion.dx;
+              const ty = (layer.clip.transform.y || 0) + motion.dy;
+              const sx = (layer.clip.transform.scale || 0.45) * motion.scaleX;
+              const sy = (layer.clip.transform.scale || 0.45) * motion.scaleY;
+              const rot = (layer.clip.transform.rotation || 0) + motion.rotation;
               return (
                 <div
                   key={layer.clip.id}
                   className="absolute inset-0 flex items-center justify-center pointer-events-none"
                   style={{
                     zIndex,
-                    transform: `translate(${layer.clip.transform.x}px, ${layer.clip.transform.y}px) scale(${layer.clip.transform.scale}) rotate(${layer.clip.transform.rotation}deg)`,
-                    opacity: layer.clip.transform.opacity ?? 1,
-                    filter: buildCssFilter(layer.clip.effects),
+                    transform: `translate(${tx}px, ${ty}px) scale(${sx}, ${sy}) rotate(${rot}deg)`,
+                    opacity: Math.max(0, Math.min(1, (layer.clip.transform.opacity ?? 1) * motion.opacity)),
                   }}
                 >
-                  <img 
-                    src={layer.asset.url} 
+                  <img
+                    src={`data:image/svg+xml;utf8,${encodeURIComponent(layer.clip.stickerSvg)}`}
                     alt={layer.clip.name}
                     data-clip-id={layer.clip.id}
-                    className={`${fitMode === 'contain' ? 'max-w-full max-h-full' : 'w-full h-full'} pointer-events-auto cursor-pointer ${
-                      !isLayerSelected ? 'hover:outline hover:outline-2 hover:outline-purple-400/60' : ''
+                    className={`max-w-[55%] max-h-[55%] object-contain pointer-events-auto cursor-pointer ${
+                      !isLayerSelected ? 'hover:outline hover:outline-2 hover:outline-cyan-400/70' : ''
                     }`}
-                    style={{
-                      objectFit: fitMode,
-                      borderRadius: `${borderRadius}px`,
-                      border: borderWidth > 0 ? `${borderWidth}px solid ${borderColor}` : undefined,
-                      boxShadow: dropShadow ? '0 10px 25px -5px rgba(0, 0, 0, 0.7), 0 8px 10px -6px rgba(0, 0, 0, 0.7)' : undefined,
-                    }}
                   />
                 </div>
               );
@@ -792,29 +858,63 @@ export function VideoPreviewCanvas() {
             return null;
           })}
 
-          {/* Active Text Overlays (Clickable to select) */}
+          {activeFlashAlpha > 0.02 && (
+            <div
+              className="absolute inset-0 pointer-events-none bg-white z-40"
+              style={{ opacity: activeFlashAlpha }}
+            />
+          )}
+
+          {/* Active Text Overlays (Rich Styled + Animated + Clickable) */}
           {activeTextClips.map((textClip, idx) => {
             const isTextSelected = selectedClip?.id === textClip.id;
+            const localT = Math.max(0, currentTime - textClip.timelineStart);
+            const motion = evaluateClipMotion(textClip, localT);
+            const tx = (textClip.transform.x || 0) + motion.dx;
+            const ty = (textClip.transform.y || 0) + motion.dy;
+            const sx = (textClip.transform.scale || 1) * motion.scaleX;
+            const sy = (textClip.transform.scale || 1) * motion.scaleY;
+            const rot = (textClip.transform.rotation || 0) + motion.rotation;
+            const opacity = Math.max(0, Math.min(1, (textClip.transform.opacity ?? 1) * motion.opacity));
+
             return (
               <div
                 key={textClip.id}
                 className="absolute inset-x-0 bottom-12 flex justify-center px-4 pointer-events-none"
                 style={{
                   zIndex: 100 + idx,
-                  transform: `scale(${textClip.transform.scale}) translate(${textClip.transform.x}px, ${textClip.transform.y}px)`,
+                  transform: `translate(${tx}px, ${ty}px) scale(${sx}, ${sy}) rotate(${rot}deg)`,
+                  opacity,
                 }}
               >
                 <div
                   data-clip-id={textClip.id}
-                  className={`px-4 py-1.5 rounded bg-black/70 backdrop-blur-sm text-center font-bold tracking-tight shadow-lg border pointer-events-auto cursor-pointer transition-all ${
+                  className={`text-center tracking-tight shadow-lg border pointer-events-auto cursor-pointer transition-all ${
                     isTextSelected
                       ? 'border-blue-400 ring-2 ring-blue-500/60'
                       : 'border-white/10 hover:border-amber-400/70'
                   }`}
                   style={{
-                    color: textClip.textColor || '#ffffff',
+                    color: textClip.gradientColors ? 'transparent' : textClip.textColor || '#ffffff',
+                    backgroundImage: textClip.gradientColors
+                      ? `linear-gradient(90deg, ${textClip.gradientColors[0]}, ${textClip.gradientColors[1]})`
+                      : undefined,
+                    WebkitBackgroundClip: textClip.gradientColors ? 'text' : undefined,
+                    backgroundColor: !textClip.gradientColors
+                      ? textClip.textBgColor || 'rgba(0,0,0,0.7)'
+                      : undefined,
                     fontSize: `${Math.max(14, (textClip.fontSize || 32) * 0.45)}px`,
                     fontFamily: textClip.fontFamily || 'Inter',
+                    fontWeight: textClip.fontWeight || '800',
+                    letterSpacing: textClip.letterSpacing ? `${textClip.letterSpacing}px` : undefined,
+                    padding: `${textClip.bgPadding ?? 6}px ${(textClip.bgPadding ?? 6) * 1.8}px`,
+                    borderRadius: `${textClip.bgRadius ?? 8}px`,
+                    WebkitTextStroke: textClip.strokeWidth
+                      ? `${Math.max(1, textClip.strokeWidth * 0.5)}px ${textClip.strokeColor || '#000'}`
+                      : undefined,
+                    textShadow: textClip.shadowBlur
+                      ? `0 2px ${textClip.shadowBlur}px ${textClip.shadowColor || 'rgba(0,0,0,0.85)'}`
+                      : undefined,
                   }}
                 >
                   {textClip.textContent}
@@ -827,6 +927,7 @@ export function VideoPreviewCanvas() {
           {activeSelectedVisualClip && (
             <WireframeGizmo
               clip={activeSelectedVisualClip}
+              stageScale={totalStageScale}
               onTransformChange={(updates) => updateClipTransform(activeSelectedVisualClip.id, updates, { skipHistory: true })}
               onInteractionStart={beginHistoryTransaction}
               onInteractionEnd={endHistoryTransaction}
@@ -909,6 +1010,7 @@ export function VideoPreviewCanvas() {
               </div>
             </div>
           )}
+          </div>
         </div>
       </div>
 

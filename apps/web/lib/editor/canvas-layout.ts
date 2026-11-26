@@ -5,7 +5,7 @@
  * Container Margin/Gap Measurement, and Timeline Collision / Auto-Align Engine.
  */
 
-import { TimelineClip, Transform } from './types';
+import { TimelineClip, Track, Transform } from './types';
 
 export interface CanvasBoundingBox {
   id: string;
@@ -448,4 +448,72 @@ export function packTrackMediaSequentially(
     cursor += clip.duration + gapSeconds;
     return nextClip;
   });
+}
+
+export const MAIN_VIDEO_TRACK_ID = 'track-v1';
+
+/**
+ * CapCut-style magnetic reordering on the Main Video track:
+ * prevents leaving gaps before the first clip or between adjacent clips,
+ * while letting users reorder clips by dragging past neighbor boundaries.
+ */
+export function moveClipMagnetically(
+  clips: TimelineClip[],
+  clipId: string,
+  proposedStart: number
+): TimelineClip[] {
+  const moving = clips.find((c) => c.id === clipId);
+  if (!moving) return clips;
+
+  const others = clips
+    .filter((c) => c.id !== clipId)
+    .sort((a, b) => a.timelineStart - b.timelineStart);
+
+  const clampedProposed = Math.max(0, proposedStart);
+  let cursor = 0;
+  let bestIndex = 0;
+  let bestDist = Infinity;
+
+  for (let k = 0; k <= others.length; k++) {
+    const dist = Math.abs(clampedProposed - cursor);
+    if (dist < bestDist) {
+      bestDist = dist;
+      bestIndex = k;
+    }
+    if (k < others.length) {
+      cursor += others[k]!.duration;
+    }
+  }
+
+  const ordered = [
+    ...others.slice(0, bestIndex),
+    moving,
+    ...others.slice(bestIndex),
+  ];
+
+  let nextStart = 0;
+  return ordered.map((c) => {
+    const updated = { ...c, timelineStart: Number(nextStart.toFixed(3)) };
+    nextStart += updated.duration;
+    return updated;
+  });
+}
+
+/**
+ * Ensures the Main Video track (`track-v1`) remains strictly gap-free across edits.
+ */
+export function enforceMainTrackMagnetism(tracks: Track[]): Track[] {
+  return tracks.map((t) =>
+    t.id === MAIN_VIDEO_TRACK_ID ? { ...t, clips: packTrackMediaSequentially(t.clips, 0) } : t
+  );
+}
+
+/**
+ * Computes an elastic timeline duration that always accommodates long clips (>34s+).
+ */
+export function computeElasticTimelineDuration(tracks: Track[], minDuration: number = 30): number {
+  const allClips = tracks.flatMap((t) => t.clips);
+  const maxEnd =
+    allClips.length > 0 ? Math.max(...allClips.map((c) => c.timelineStart + c.duration)) : 0;
+  return Math.max(minDuration, Math.ceil(maxEnd + 12));
 }

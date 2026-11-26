@@ -8,6 +8,21 @@ import { EditorProject } from '../../lib/editor/types';
 import { secondsToTimecode } from '../../lib/editor/time-utils';
 import { buildCssFilter, buildMasterFilter, getExportDimensions } from '../../lib/editor/render-utils';
 import { runNativeFFmpegExport } from '../../lib/editor/ffmpeg-export';
+import { WebGL2LayerProcessor } from '../../lib/editor/engine/compositor-webgl';
+import { extractColorGradeValues } from '../../lib/editor/engine/grading';
+import { evaluateClipMotion } from '../../lib/editor/engine/animations';
+import {
+  getCurveDurationMultiplier,
+  mapTimelineToSourceOffset,
+} from '../../lib/editor/engine/velocity';
+import {
+  findActiveTransitionAtTime,
+  getTransitionVisualPair,
+} from '../../lib/editor/engine/transitions';
+import {
+  renderRichTextToCanvas,
+  renderSvgStickerToCanvas,
+} from '../../lib/editor/engine/export-raster';
 import { isTauriRuntime, normalizeJoin, openPathInExplorer, saveExportedVideoToDisk } from '../../lib/workspace/storage';
 import { Button } from '../ui/button';
 import { Badge } from '../ui/badge';
@@ -162,8 +177,27 @@ async function mixProjectAudioOffline(project: EditorProject, exportDuration: nu
 
     const source = offlineCtx.createBufferSource();
     source.buffer = buffer;
+    const matchedClip = project.timeline.tracks
+      .flatMap((t) => t.clips)
+      .find((c) => c.assetId === item.assetId && c.timelineStart === item.timelineStart);
+    if (matchedClip?.speedCurve) {
+      const mult = getCurveDurationMultiplier(matchedClip.speedCurve);
+      source.playbackRate.value = Math.max(0.1, Math.min(8, 1 / mult));
+    }
+
     const gain = offlineCtx.createGain();
-    gain.gain.value = Math.max(0, Math.min(2, item.volume / 100));
+    const baseGain = Math.max(0, Math.min(2, item.volume / 100));
+    gain.gain.setValueAtTime(baseGain, item.timelineStart);
+    if (matchedClip?.fadeIn && matchedClip.fadeIn > 0) {
+      gain.gain.setValueAtTime(0, item.timelineStart);
+      gain.gain.linearRampToValueAtTime(baseGain, item.timelineStart + Math.min(matchedClip.fadeIn, item.duration));
+    }
+    if (matchedClip?.fadeOut && matchedClip.fadeOut > 0) {
+      const outStart = item.timelineStart + Math.max(0, item.duration - matchedClip.fadeOut);
+      gain.gain.setValueAtTime(baseGain, outStart);
+      gain.gain.linearRampToValueAtTime(0, item.timelineStart + item.duration);
+    }
+
     source.connect(gain);
     gain.connect(offlineCtx.destination);
     source.start(item.timelineStart, item.sourceStart, playableDur);
@@ -296,12 +330,24 @@ export function ExportModal({ isOpen, onClose }: ExportModalProps) {
       const ctx = offscreen.getContext('2d', { alpha: false });
       if (!ctx) throw new Error('Could not initialize Canvas 2D Context');
 
-      setStatusMessage('Loading frame decoders for step-accurate compositing...');
+      setStatusMessage('Loading WebGL2 shader compositor & raster layers...');
       const videoElementsByClip = new Map<string, HTMLVideoElement>();
       const imageElementsByClip = new Map<string, HTMLImageElement>();
+      const stickerCanvasesByClip = new Map<string, HTMLCanvasElement>();
+      const richTextCanvasesByClip = new Map<string, HTMLCanvasElement>();
+      const webglProc = new WebGL2LayerProcessor();
 
       for (const track of project.timeline.tracks) {
         for (const clip of track.clips) {
+          if (clip.type === 'sticker' && clip.stickerSvg) {
+            const stCanvas = await renderSvgStickerToCanvas(clip.stickerSvg, Math.round(exportH * 0.45));
+            stickerCanvasesByClip.set(clip.id, stCanvas);
+            continue;
+          }
+          if (clip.type === 'text' && clip.textContent) {
+            richTextCanvasesByClip.set(clip.id, renderRichTextToCanvas(clip, exportH));
+            continue;
+          }
           if (!clip.assetId) continue;
           const asset = project.mediaLibrary.find(a => a.id === clip.assetId);
           if (!asset?.url) continue;
@@ -355,20 +401,37 @@ export function ExportModal({ isOpen, onClose }: ExportModalProps) {
         ctx.fillStyle = '#000000';
         ctx.fillRect(0, 0, exportW, exportH);
 
-        if (isClippingMode) {
-          const primaryClip = allClips.find(c => c.type === 'video');
-          const vid = primaryClip ? videoElementsByClip.get(primaryClip.id) : undefined;
-          if (primaryClip && vid) {
-            const vw = vid.videoWidth || 1920;
-            const vh = vid.videoHeight || 1080;
+        const primaryClippingClip = isClippingMode ? allClips.find(c => c.type === 'video') : undefined;
+        let flashOverlayAlpha = 0;
+
+        if (isClippingMode && primaryClippingClip) {
+          const vid = videoElementsByClip.get(primaryClippingClip.id);
+          if (vid && vid.readyState >= 2) {
+            const grade = extractColorGradeValues(primaryClippingClip.effects, primaryClippingClip.lutId);
+            const shadedSource: HTMLVideoElement | HTMLCanvasElement =
+              webglProc.isReady() &&
+              webglProc.renderFrame(
+                vid,
+                vid.videoWidth || 1280,
+                vid.videoHeight || 720,
+                grade,
+                primaryClippingClip.mask,
+                primaryClippingClip.layerEffects || [],
+                currentT,
+              )
+                ? webglProc.canvas
+                : vid;
+
+            const vw = shadedSource instanceof HTMLVideoElement ? (shadedSource.videoWidth || 1920) : shadedSource.width;
+            const vh = shadedSource instanceof HTMLVideoElement ? (shadedSource.videoHeight || 1080) : shadedSource.height;
             const topH = Math.round(framerSettings.splitRatio * exportH);
             const btmH = exportH - topH;
 
             const tb = framerSettings.topBox;
-            ctx.drawImage(vid, (tb.x / 100) * vw, (tb.y / 100) * vh, Math.max(1, (tb.width / 100) * vw), Math.max(1, (tb.height / 100) * vh), 0, 0, exportW, topH);
+            ctx.drawImage(shadedSource, (tb.x / 100) * vw, (tb.y / 100) * vh, Math.max(1, (tb.width / 100) * vw), Math.max(1, (tb.height / 100) * vh), 0, 0, exportW, topH);
 
             const bb = framerSettings.bottomBox;
-            ctx.drawImage(vid, (bb.x / 100) * vw, (bb.y / 100) * vh, Math.max(1, (bb.width / 100) * vw), Math.max(1, (bb.height / 100) * vh), 0, topH, exportW, btmH);
+            ctx.drawImage(shadedSource, (bb.x / 100) * vw, (bb.y / 100) * vh, Math.max(1, (bb.width / 100) * vw), Math.max(1, (bb.height / 100) * vh), 0, topH, exportW, btmH);
 
             if (framerSettings.dividerWidth > 0) {
               const divPx = framerSettings.dividerWidth * (exportH / 720);
@@ -376,75 +439,137 @@ export function ExportModal({ isOpen, onClose }: ExportModalProps) {
               ctx.fillRect(0, topH - divPx / 2, exportW, divPx);
             }
           }
-        } else {
-          ctx.save();
-          if (masterFilterStr !== 'none') ctx.filter = masterFilterStr;
+        }
 
-          for (const track of bottomToTopVideoTracks) {
-            for (const clip of track.clips) {
-              if (currentT < clip.timelineStart || currentT > clip.timelineStart + clip.duration) continue;
+        // Composite multi-track layers, transitions, stickers, animations, masks & rich text (unified in both modes!)
+        ctx.save();
+        if (masterFilterStr !== 'none') ctx.filter = masterFilterStr;
+        const scaleRatioX = exportW / 680;
+        const scaleRatioY = exportH / 382;
+        const transitions = project.timeline.transitions || [];
 
-              const scaleRatioX = exportW / 680;
-              const scaleRatioY = exportH / 382;
-              const cx = exportW / 2 + (clip.transform.x * scaleRatioX);
-              const cy = exportH / 2 + (clip.transform.y * scaleRatioY);
-              const br = (clip.borderRadius || 0) * scaleRatioX;
-              const bw = (clip.borderWidth || 0) * scaleRatioX;
-              const bc = clip.borderColor || '#ffffff';
+        for (const track of bottomToTopVideoTracks) {
+          const activeTr = findActiveTransitionAtTime(track, transitions, currentT);
+          const clipsToRender = activeTr
+            ? [
+                { clip: activeTr.fromClip, trSide: 'out' as const },
+                { clip: activeTr.toClip, trSide: 'in' as const },
+              ]
+            : track.clips
+                .filter(c => c.id !== primaryClippingClip?.id && currentT >= c.timelineStart && currentT <= c.timelineStart + c.duration)
+                .map(clip => ({ clip, trSide: null }));
 
-              const mediaEl = clip.type === 'video'
-                ? videoElementsByClip.get(clip.id)
-                : clip.type === 'image'
+          for (const { clip, trSide } of clipsToRender) {
+            if (clip.id === primaryClippingClip?.id) continue;
+            const localT = Math.max(0, currentT - clip.timelineStart);
+            const motion = evaluateClipMotion(clip, localT);
+
+            let trDx = 0;
+            let trDy = 0;
+            let trScale = 1;
+            let trOpacity = 1;
+            if (trSide && activeTr) {
+              const pair = getTransitionVisualPair(activeTr.edge.type, activeTr.progress, exportW, exportH);
+              if (pair.flashAlpha > flashOverlayAlpha) flashOverlayAlpha = pair.flashAlpha;
+              if (trSide === 'out') {
+                trDx = pair.outDx;
+                trDy = pair.outDy;
+                trScale = pair.outScale;
+                trOpacity = pair.outOpacity;
+              } else {
+                trDx = pair.inDx;
+                trDy = pair.inDy;
+                trScale = pair.inScale;
+                trOpacity = pair.inOpacity;
+              }
+            }
+
+            const cx = exportW / 2 + ((clip.transform.x + motion.dx) * scaleRatioX) + trDx;
+            const cy = exportH / 2 + ((clip.transform.y + motion.dy) * scaleRatioY) + trDy;
+
+            if (clip.type === 'sticker') {
+              const stCanvas = stickerCanvasesByClip.get(clip.id);
+              if (!stCanvas) continue;
+              ctx.save();
+              ctx.translate(cx, cy);
+              ctx.rotate(((clip.transform.rotation + motion.rotation) * Math.PI) / 180);
+              ctx.scale((clip.transform.scale || 0.45) * motion.scaleX * trScale, (clip.transform.scale || 0.45) * motion.scaleY * trScale);
+              ctx.globalAlpha = Math.max(0, Math.min(1, (clip.transform.opacity ?? 1) * motion.opacity * trOpacity));
+              ctx.drawImage(stCanvas, -stCanvas.width / 2, -stCanvas.height / 2);
+              ctx.restore();
+              continue;
+            }
+
+            const mediaEl = clip.type === 'video'
+              ? videoElementsByClip.get(clip.id)
+              : clip.type === 'image'
                 ? imageElementsByClip.get(clip.id)
                 : undefined;
+            if (!mediaEl) continue;
 
-              if (!mediaEl) continue;
+            const grade = extractColorGradeValues(clip.effects, clip.lutId);
+            const mediaW = mediaEl instanceof HTMLVideoElement ? (mediaEl.videoWidth || exportW) : (mediaEl.naturalWidth || exportW);
+            const mediaH = mediaEl instanceof HTMLVideoElement ? (mediaEl.videoHeight || exportH) : (mediaEl.naturalHeight || exportH);
+            const renderedSource: HTMLVideoElement | HTMLImageElement | HTMLCanvasElement =
+              webglProc.isReady() &&
+              webglProc.renderFrame(mediaEl, Math.min(1920, mediaW), Math.min(1080, mediaH), grade, clip.mask, clip.layerEffects || [], currentT)
+                ? webglProc.canvas
+                : mediaEl;
 
-              ctx.save();
-              const cf = buildCssFilter(clip.effects);
-              if (cf !== 'none') ctx.filter = masterFilterStr !== 'none' ? `${masterFilterStr} ${cf}` : cf;
-              ctx.translate(cx, cy);
-              ctx.rotate((clip.transform.rotation * Math.PI) / 180);
-              ctx.scale(clip.transform.scale, clip.transform.scale);
-              ctx.globalAlpha = clip.transform.opacity ?? 1.0;
-              if (clip.dropShadow) {
-                ctx.shadowColor = 'rgba(0,0,0,0.65)';
-                ctx.shadowBlur = 18 * scaleRatioX;
-                ctx.shadowOffsetY = 8 * scaleRatioY;
-              }
-              drawFittedMedia(ctx, mediaEl, exportW, exportH, clip.fitMode || 'cover', br, bw, bc);
-              ctx.restore();
-            }
-          }
-          ctx.restore();
+            const br = (clip.borderRadius || 0) * scaleRatioX;
+            const bw = (clip.borderWidth || 0) * scaleRatioX;
+            const bc = clip.borderColor || '#ffffff';
 
-          ctx.filter = 'none';
-          for (const track of textTracks) {
-            const clip = track.clips.find(c => currentT >= c.timelineStart && currentT <= c.timelineStart + c.duration);
-            if (!clip?.textContent) continue;
-
-            const fontSize = Math.max(16, Math.round((clip.fontSize || 28) * (exportH / 480)));
             ctx.save();
-            ctx.font = `bold ${fontSize}px Inter, sans-serif`;
-            ctx.textAlign = 'center';
-            ctx.textBaseline = 'middle';
-
-            const metrics = ctx.measureText(clip.textContent);
-            const boxW = metrics.width + fontSize * 1.4;
-            const boxH = fontSize * 1.25 + fontSize * 0.8;
-            const posX = exportW / 2 + clip.transform.x * (exportW / 680);
-            const posY = exportH * 0.84 + clip.transform.y * (exportH / 382);
-
-            ctx.translate(posX, posY);
-            ctx.scale(clip.transform.scale || 1, clip.transform.scale || 1);
-            ctx.fillStyle = clip.textBgColor || 'rgba(0, 0, 0, 0.75)';
-            ctx.beginPath();
-            ctx.roundRect(-boxW / 2, -boxH / 2, boxW, boxH, 8 * (exportH / 720));
-            ctx.fill();
-            ctx.fillStyle = clip.textColor || '#ffffff';
-            ctx.fillText(clip.textContent, 0, 0);
+            if (!(renderedSource instanceof HTMLCanvasElement)) {
+              const cf = buildCssFilter(clip.effects, clip.lutId);
+              if (cf !== 'none') ctx.filter = masterFilterStr !== 'none' ? `${masterFilterStr} ${cf}` : cf;
+            }
+            ctx.translate(cx, cy);
+            ctx.rotate(((clip.transform.rotation + motion.rotation) * Math.PI) / 180);
+            ctx.scale(clip.transform.scale * motion.scaleX * trScale, clip.transform.scale * motion.scaleY * trScale);
+            ctx.globalAlpha = Math.max(0, Math.min(1, (clip.transform.opacity ?? 1) * motion.opacity * trOpacity));
+            if (clip.dropShadow) {
+              ctx.shadowColor = 'rgba(0,0,0,0.65)';
+              ctx.shadowBlur = 18 * scaleRatioX;
+              ctx.shadowOffsetY = 8 * scaleRatioY;
+            }
+            if (renderedSource instanceof HTMLCanvasElement) {
+              ctx.drawImage(renderedSource, -exportW / 2, -exportH / 2, exportW, exportH);
+            } else {
+              drawFittedMedia(ctx, renderedSource, exportW, exportH, clip.fitMode || 'cover', br, bw, bc);
+            }
             ctx.restore();
           }
+        }
+        ctx.restore();
+
+        if (flashOverlayAlpha > 0.02) {
+          ctx.save();
+          ctx.fillStyle = `rgba(255,255,255,${flashOverlayAlpha.toFixed(2)})`;
+          ctx.fillRect(0, 0, exportW, exportH);
+          ctx.restore();
+        }
+
+        ctx.filter = 'none';
+        for (const track of textTracks) {
+          const clip = track.clips.find(c => currentT >= c.timelineStart && currentT <= c.timelineStart + c.duration);
+          if (!clip?.textContent) continue;
+          const txtCanvas = richTextCanvasesByClip.get(clip.id);
+          if (!txtCanvas) continue;
+          const localT = Math.max(0, currentT - clip.timelineStart);
+          const motion = evaluateClipMotion(clip, localT);
+
+          const posX = exportW / 2 + (clip.transform.x + motion.dx) * (exportW / 680);
+          const posY = exportH * 0.84 + (clip.transform.y + motion.dy) * (exportH / 382);
+
+          ctx.save();
+          ctx.translate(posX, posY);
+          ctx.rotate(((clip.transform.rotation + motion.rotation) * Math.PI) / 180);
+          ctx.scale((clip.transform.scale || 1) * motion.scaleX, (clip.transform.scale || 1) * motion.scaleY);
+          ctx.globalAlpha = Math.max(0, Math.min(1, (clip.transform.opacity ?? 1) * motion.opacity));
+          ctx.drawImage(txtCanvas, -txtCanvas.width / 2, -txtCanvas.height / 2);
+          ctx.restore();
         }
 
         const previewCanvas = livePreviewCanvasRef.current;
@@ -608,7 +733,7 @@ export function ExportModal({ isOpen, onClose }: ExportModalProps) {
               if (clip.type === 'video' && currentT >= clip.timelineStart && currentT <= clip.timelineStart + clip.duration) {
                 const v = videoElementsByClip.get(clip.id);
                 if (v) {
-                  activeSeekPromises.push(seekElementExact(v, (currentT - clip.timelineStart) + clip.sourceStart));
+                  activeSeekPromises.push(seekElementExact(v, clip.sourceStart + mapTimelineToSourceOffset(clip, currentT - clip.timelineStart)));
                 }
               }
             }
@@ -677,7 +802,7 @@ export function ExportModal({ isOpen, onClose }: ExportModalProps) {
             for (const clip of track.clips) {
               if (clip.type === 'video' && currentT >= clip.timelineStart && currentT <= clip.timelineStart + clip.duration) {
                 const v = videoElementsByClip.get(clip.id);
-                if (v) activeSeekPromises.push(seekElementExact(v, (currentT - clip.timelineStart) + clip.sourceStart));
+                if (v) activeSeekPromises.push(seekElementExact(v, clip.sourceStart + mapTimelineToSourceOffset(clip, currentT - clip.timelineStart)));
               }
             }
           }
@@ -692,6 +817,8 @@ export function ExportModal({ isOpen, onClose }: ExportModalProps) {
         setStatusMessage('Saving rendered video...');
         finalBlob = await recorderStopPromise;
       }
+
+      webglProc.dispose();
 
       const finalBlobUrl = URL.createObjectURL(finalBlob);
       setExportedBlobUrl(finalBlobUrl);

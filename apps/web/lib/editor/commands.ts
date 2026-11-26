@@ -13,12 +13,29 @@ function cloneEditableSnapshot(snap: EditorSnapshot): EditorSnapshot {
       settings: { ...snap.project.settings },
       timeline: {
         ...snap.project.timeline,
+        transitions: (snap.project.timeline.transitions || []).map((t) => ({ ...t })),
         tracks: snap.project.timeline.tracks.map((track) => ({
           ...track,
           clips: track.clips.map((clip) => ({
             ...clip,
             transform: { ...clip.transform },
             effects: (clip.effects || []).map((eff) => ({ ...eff })),
+            animations: clip.animations
+              ? {
+                  in: clip.animations.in ? { ...clip.animations.in } : undefined,
+                  out: clip.animations.out ? { ...clip.animations.out } : undefined,
+                  middle: clip.animations.middle ? { ...clip.animations.middle } : undefined,
+                }
+              : undefined,
+            mask: clip.mask ? { ...clip.mask } : undefined,
+            speedCurve: clip.speedCurve
+              ? {
+                  presetId: clip.speedCurve.presetId,
+                  points: clip.speedCurve.points.map((pt) => ({ ...pt })),
+                }
+              : undefined,
+            layerEffects: clip.layerEffects ? [...clip.layerEffects] : undefined,
+            gradientColors: clip.gradientColors ? [...clip.gradientColors] as [string, string] : undefined,
           })),
         })),
       },

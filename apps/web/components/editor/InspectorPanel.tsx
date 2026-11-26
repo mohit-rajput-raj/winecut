@@ -1,46 +1,57 @@
 'use client';
 
-import React from 'react';
+import React, { useState } from 'react';
 import { useEditor } from '../../lib/editor/EditorContext';
-import { EffectType } from '../../lib/editor/types';
+import { EFFECT_BUNDLES } from '../../lib/editor/presets/bundles';
 import { Badge } from '../ui/badge';
 import { Button } from '../ui/button';
-import { 
-  Trash2, 
-  Scissors, 
-  Volume2, 
-  Type, 
-  Maximize2, 
-  Layers, 
-  Sun,
-  ArrowDownToLine,
-  Sliders,
-  Droplets,
+import { ColorTab } from './inspector/ColorTab';
+import { AnimateTab } from './inspector/AnimateTab';
+import { MaskTab } from './inspector/MaskTab';
+import { SpeedGraphTab } from './inspector/SpeedGraphTab';
+import { FramerTab } from './inspector/FramerTab';
+import {
+  Trash2,
+  Scissors,
+  Volume2,
+  Type,
+  Maximize2,
+  Layers,
   Palette,
-  Sparkles,
+  Droplets,
   RotateCcw,
-  Eye
 } from 'lucide-react';
 
-  export function InspectorPanel() {
-  const { 
-    project, 
-    selectedClip, 
+type InspectorTabId = 'framer' | 'basic' | 'color' | 'animate' | 'mask' | 'speed';
+
+export function InspectorPanel() {
+  const {
+    project,
+    selectedClip,
     framerSettings,
     updateFramerSettings,
     updateFramerBox,
     sendClipperToEditor,
-    updateClip, 
-    updateClipTransform, 
-    updateClipEffect, 
+    updateClip,
+    updateClipTransform,
+    updateClipEffect,
     batchUpdateClipEffects,
+    applyClipFilterPreset,
+    updateClipMask,
+    updateClipAnimation,
+    updateClipSpeedCurve,
+    toggleClipLayerEffect,
     updateProjectSettings,
-    splitClipAtPlayhead, 
+    splitClipAtPlayhead,
     deleteClip,
     extractAudioFromClip,
     beginHistoryTransaction,
-    endHistoryTransaction
+    endHistoryTransaction,
   } = useEditor();
+
+  const [activeTab, setActiveTab] = useState<InspectorTabId>(
+    project.mode === 'clipping' ? 'framer' : 'basic',
+  );
 
   const rangeTx = (label: string) => ({
     onPointerDown: () => beginHistoryTransaction(label),
@@ -48,1223 +59,618 @@ import {
     onPointerCancel: () => endHistoryTransaction(),
   });
 
-  // Clip Cutter Wireframe Inspector is dedicated exclusively to Clipping projects
-  if (project.mode === 'clipping') {
+  // In Clip Cutter mode, resolve selected clip OR default primary video clip seamlessly so all tools work
+  const fallbackPrimaryVideo = project.timeline.tracks
+    .filter((t) => t.type === 'video')
+    .flatMap((t) => t.clips)
+    .find((c) => c.type === 'video') || null;
+  const effectiveClip = selectedClip || (project.mode === 'clipping' ? fallbackPrimaryVideo : null);
+
+  const resetClipGrading = (clipId: string) => {
+    applyClipFilterPreset(clipId, 'none');
+    batchUpdateClipEffects(clipId, {
+      exposure: 0,
+      brightness: 100,
+      contrast: 100,
+      highlights: 0,
+      shadows: 0,
+      saturation: 100,
+      temperature: 0,
+      tint: 0,
+      hue: 0,
+      sharpen: 0,
+      fade: 0,
+      vignette: 0,
+      grain: 0,
+      blur: 0,
+      sepia: 0,
+      grayscale: 0,
+      invert: 0,
+    });
+  };
+
+  // Master Screen Grade view when nothing is selected in Video Editor (or Master tab requested)
+  if (!effectiveClip && project.mode !== 'clipping') {
+    const s = project.settings;
     return (
       <aside className="w-full h-full bg-zinc-950 p-3.5 flex flex-col text-zinc-300 select-none overflow-y-auto custom-scrollbar">
-        {/* Header */}
-        <div className="flex items-center justify-between pb-2.5 border-b border-zinc-800 text-xs font-semibold text-zinc-400 uppercase tracking-wider">
-          <span className="flex items-center gap-1.5 text-emerald-400">
-            <Sparkles className="w-4 h-4" />
-            <span>Smart Cut Framer</span>
-          </span>
-          <button
-            onClick={() => {
-              beginHistoryTransaction('Reset dual speaker framing');
-              updateFramerSettings({
-                splitRatio: 0.5,
-                dividerWidth: 2,
-                dividerColor: '#000000',
-                viewMode: 'framing_crop',
-              });
-              updateFramerBox('top', { x: 6, y: 8, width: 42, height: 84 });
-              updateFramerBox('bottom', { x: 52, y: 8, width: 42, height: 84 });
-              endHistoryTransaction();
-            }}
-            className="text-[10px] text-zinc-500 hover:text-zinc-300 flex items-center gap-1 transition-colors"
-            title="Reset to Default Dual Speaker Framing"
-          >
-            <RotateCcw className="w-3 h-3" />
-            <span>Reset</span>
-          </button>
-        </div>
-
-        <div className="mt-3.5 space-y-4 text-xs">
-          {/* Target Format & View Mode */}
-          <div className="space-y-2">
-            <label className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider block">
-              Output Format & Mode
-            </label>
-            <div className="bg-zinc-900/60 p-2.5 rounded-md border border-zinc-800 space-y-2">
-              <div className="flex items-center justify-between">
-                <span className="text-[11px] text-zinc-300">Target Aspect Ratio</span>
-                <span className="px-2 py-0.5 rounded text-[10px] font-mono bg-emerald-950/80 text-emerald-400 border border-emerald-800/80">
-                  9:16 Vertical Short
-                </span>
-              </div>
-              <div className="grid grid-cols-2 gap-1.5 pt-1">
-                <button
-                  onClick={() => updateFramerSettings({ viewMode: 'framing_crop' })}
-                  className={`py-1.5 px-2 rounded text-[11px] font-medium border text-center transition-all ${
-                    framerSettings.viewMode === 'framing_crop'
-                      ? 'bg-emerald-600/30 border-emerald-500 text-emerald-300'
-                      : 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-zinc-200'
-                  }`}
-                >
-                  Framing Crop Boxes
-                </button>
-                <button
-                  onClick={() => updateFramerSettings({ viewMode: 'split_preview' })}
-                  className={`py-1.5 px-2 rounded text-[11px] font-medium border text-center transition-all ${
-                    framerSettings.viewMode === 'split_preview'
-                      ? 'bg-emerald-600/30 border-emerald-500 text-emerald-300'
-                      : 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-zinc-200'
-                  }`}
-                >
-                  9:16 Split Preview
-                </button>
-              </div>
-            </div>
-          </div>
-
-          {/* Top Speaker Card */}
-          <div className="space-y-2">
-            <div className="flex items-center justify-between text-[11px] font-semibold text-emerald-400 uppercase tracking-wider">
-              <span className="flex items-center gap-1.5">
-                <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 inline-block shadow-sm" />
-                <span>Top Speaker (Box 1)</span>
-              </span>
-              <span className="text-[10px] text-zinc-400 font-mono">
-                {Math.round(framerSettings.topBox.width)}% × {Math.round(framerSettings.topBox.height)}%
-              </span>
-            </div>
-
-            <div className="bg-zinc-900/60 p-2.5 rounded-md border border-emerald-900/40 space-y-2">
-              <div className="grid grid-cols-2 gap-2">
-                <div>
-                  <div className="flex justify-between text-[10px] text-zinc-400 mb-0.5">
-                    <span>X Position</span>
-                    <span className="font-mono text-zinc-200">{Math.round(framerSettings.topBox.x)}%</span>
-                  </div>
-                  <input
-                    type="range"
-                    min="0"
-                    max="80"
-                    value={framerSettings.topBox.x}
-                    {...rangeTx('Adjust top box X')}
-                    onChange={(e) => updateFramerBox('top', { x: parseInt(e.target.value) || 0 })}
-                    className="w-full h-1 bg-zinc-800 rounded appearance-none cursor-pointer accent-emerald-500"
-                  />
-                </div>
-                <div>
-                  <div className="flex justify-between text-[10px] text-zinc-400 mb-0.5">
-                    <span>Y Position</span>
-                    <span className="font-mono text-zinc-200">{Math.round(framerSettings.topBox.y)}%</span>
-                  </div>
-                  <input
-                    type="range"
-                    min="0"
-                    max="80"
-                    value={framerSettings.topBox.y}
-                    {...rangeTx('Adjust top box Y')}
-                    onChange={(e) => updateFramerBox('top', { y: parseInt(e.target.value) || 0 })}
-                    className="w-full h-1 bg-zinc-800 rounded appearance-none cursor-pointer accent-emerald-500"
-                  />
-                </div>
-              </div>
-
-              <div className="grid grid-cols-2 gap-2 pt-1 border-t border-zinc-800/80">
-                <div>
-                  <div className="flex justify-between text-[10px] text-zinc-400 mb-0.5">
-                    <span>Crop Width</span>
-                    <span className="font-mono text-zinc-200">{Math.round(framerSettings.topBox.width)}%</span>
-                  </div>
-                  <input
-                    type="range"
-                    min="20"
-                    max="90"
-                    value={framerSettings.topBox.width}
-                    {...rangeTx('Adjust top box width')}
-                    onChange={(e) => updateFramerBox('top', { width: parseInt(e.target.value) || 20 })}
-                    className="w-full h-1 bg-zinc-800 rounded appearance-none cursor-pointer accent-emerald-500"
-                  />
-                </div>
-                <div>
-                  <div className="flex justify-between text-[10px] text-zinc-400 mb-0.5">
-                    <span>Crop Height</span>
-                    <span className="font-mono text-zinc-200">{Math.round(framerSettings.topBox.height)}%</span>
-                  </div>
-                  <input
-                    type="range"
-                    min="20"
-                    max="100"
-                    value={framerSettings.topBox.height}
-                    {...rangeTx('Adjust top box height')}
-                    onChange={(e) => updateFramerBox('top', { height: parseInt(e.target.value) || 20 })}
-                    className="w-full h-1 bg-zinc-800 rounded appearance-none cursor-pointer accent-emerald-500"
-                  />
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* Bottom Speaker Card */}
-          <div className="space-y-2">
-            <div className="flex items-center justify-between text-[11px] font-semibold text-sky-400 uppercase tracking-wider">
-              <span className="flex items-center gap-1.5">
-                <span className="w-2.5 h-2.5 rounded-full bg-sky-500 inline-block shadow-sm" />
-                <span>Bottom Speaker (Box 2)</span>
-              </span>
-              <span className="text-[10px] text-zinc-400 font-mono">
-                {Math.round(framerSettings.bottomBox.width)}% × {Math.round(framerSettings.bottomBox.height)}%
-              </span>
-            </div>
-
-            <div className="bg-zinc-900/60 p-2.5 rounded-md border border-sky-900/40 space-y-2">
-              <div className="grid grid-cols-2 gap-2">
-                <div>
-                  <div className="flex justify-between text-[10px] text-zinc-400 mb-0.5">
-                    <span>X Position</span>
-                    <span className="font-mono text-zinc-200">{Math.round(framerSettings.bottomBox.x)}%</span>
-                  </div>
-                  <input
-                    type="range"
-                    min="0"
-                    max="80"
-                    value={framerSettings.bottomBox.x}
-                    {...rangeTx('Adjust bottom box X')}
-                    onChange={(e) => updateFramerBox('bottom', { x: parseInt(e.target.value) || 0 })}
-                    className="w-full h-1 bg-zinc-800 rounded appearance-none cursor-pointer accent-sky-500"
-                  />
-                </div>
-                <div>
-                  <div className="flex justify-between text-[10px] text-zinc-400 mb-0.5">
-                    <span>Y Position</span>
-                    <span className="font-mono text-zinc-200">{Math.round(framerSettings.bottomBox.y)}%</span>
-                  </div>
-                  <input
-                    type="range"
-                    min="0"
-                    max="80"
-                    value={framerSettings.bottomBox.y}
-                    {...rangeTx('Adjust bottom box Y')}
-                    onChange={(e) => updateFramerBox('bottom', { y: parseInt(e.target.value) || 0 })}
-                    className="w-full h-1 bg-zinc-800 rounded appearance-none cursor-pointer accent-sky-500"
-                  />
-                </div>
-              </div>
-
-              <div className="grid grid-cols-2 gap-2 pt-1 border-t border-zinc-800/80">
-                <div>
-                  <div className="flex justify-between text-[10px] text-zinc-400 mb-0.5">
-                    <span>Crop Width</span>
-                    <span className="font-mono text-zinc-200">{Math.round(framerSettings.bottomBox.width)}%</span>
-                  </div>
-                  <input
-                    type="range"
-                    min="20"
-                    max="90"
-                    value={framerSettings.bottomBox.width}
-                    {...rangeTx('Adjust bottom box width')}
-                    onChange={(e) => updateFramerBox('bottom', { width: parseInt(e.target.value) || 20 })}
-                    className="w-full h-1 bg-zinc-800 rounded appearance-none cursor-pointer accent-sky-500"
-                  />
-                </div>
-                <div>
-                  <div className="flex justify-between text-[10px] text-zinc-400 mb-0.5">
-                    <span>Crop Height</span>
-                    <span className="font-mono text-zinc-200">{Math.round(framerSettings.bottomBox.height)}%</span>
-                  </div>
-                  <input
-                    type="range"
-                    min="20"
-                    max="100"
-                    value={framerSettings.bottomBox.height}
-                    {...rangeTx('Adjust bottom box height')}
-                    onChange={(e) => updateFramerBox('bottom', { height: parseInt(e.target.value) || 20 })}
-                    className="w-full h-1 bg-zinc-800 rounded appearance-none cursor-pointer accent-sky-500"
-                  />
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* Split Ratio & Divider Settings */}
-          <div className="space-y-2">
-            <label className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider block">
-              Split Ratio & Divider
-            </label>
-
-            <div className="bg-zinc-900/60 p-2.5 rounded-md border border-zinc-800 space-y-2.5">
-              <div>
-                <div className="flex justify-between text-[10px] text-zinc-400 mb-1">
-                  <span>Split Division (Top / Bottom)</span>
-                  <span className="font-mono text-zinc-200">
-                    {Math.round(framerSettings.splitRatio * 100)}% / {Math.round((1 - framerSettings.splitRatio) * 100)}%
-                  </span>
-                </div>
-                <input
-                  type="range"
-                  min="0.3"
-                  max="0.7"
-                  step="0.05"
-                  value={framerSettings.splitRatio}
-                  {...rangeTx('Adjust split ratio')}
-                  onChange={(e) => updateFramerSettings({ splitRatio: parseFloat(e.target.value) })}
-                  className="w-full h-1 bg-zinc-800 rounded appearance-none cursor-pointer accent-blue-500"
-                />
-              </div>
-
-              <div>
-                <div className="flex justify-between text-[10px] text-zinc-400 mb-1">
-                  <span>Divider Thickness</span>
-                  <span className="font-mono text-zinc-200">{framerSettings.dividerWidth}px</span>
-                </div>
-                <input
-                  type="range"
-                  min="0"
-                  max="8"
-                  value={framerSettings.dividerWidth}
-                  {...rangeTx('Adjust divider thickness')}
-                  onChange={(e) => updateFramerSettings({ dividerWidth: parseInt(e.target.value) || 0 })}
-                  className="w-full h-1 bg-zinc-800 rounded appearance-none cursor-pointer accent-blue-500"
-                />
-              </div>
-
-              <div className="flex items-center justify-between pt-1 border-t border-zinc-800 text-[10px]">
-                <span className="text-zinc-400">Divider Color</span>
-                <div className="flex items-center gap-1.5">
-                  {[
-                    { label: 'Black', color: '#000000' },
-                    { label: 'Zinc', color: '#3f3f46' },
-                    { label: 'White', color: '#ffffff' },
-                    { label: 'Cyan', color: '#38bdf8' },
-                  ].map((item) => (
-                    <button
-                      key={item.color}
-                      onClick={() => updateFramerSettings({ dividerColor: item.color })}
-                      className={`w-5 h-5 rounded-full border transition-transform ${
-                        framerSettings.dividerColor === item.color
-                          ? 'scale-110 border-white ring-1 ring-blue-500'
-                          : 'border-zinc-700 hover:scale-105'
-                      }`}
-                      style={{ backgroundColor: item.color }}
-                      title={item.label}
-                    />
-                  ))}
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* Send Framed Clip to Full Video Editor */}
-          <div className="pt-2">
-            <Button
-              onClick={sendClipperToEditor}
-              className="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-medium text-xs py-2.5 rounded-lg flex items-center justify-center gap-2 shadow-md hover:shadow-emerald-900/30 transition-all cursor-pointer"
-            >
-              <Sparkles className="w-4 h-4" />
-              <span>Send Cut to Video Editor (9:16)</span>
-            </Button>
-            <p className="text-[10px] text-zinc-500 text-center mt-1.5">
-              Converts framed speakers into multi-track layers for captions & effects
-            </p>
-          </div>
-        </div>
-      </aside>
-    );
-  }
-
-  // If no clip is selected, provide the Master Screen Blur & Global Color Grading Panel
-  if (!selectedClip) {
-    const screenBlur = project.settings.screenBlur ?? 0;
-    const masterBrightness = project.settings.masterBrightness ?? 100;
-    const masterContrast = project.settings.masterContrast ?? 100;
-    const masterSaturation = project.settings.masterSaturation ?? 100;
-    const masterTemperature = project.settings.masterTemperature ?? 0;
-    const masterHue = project.settings.masterHue ?? 0;
-
-    return (
-      <aside className="w-full h-full bg-zinc-950 p-3.5 flex flex-col text-zinc-300 select-none overflow-y-auto custom-scrollbar">
-        {/* Header */}
         <div className="flex items-center justify-between pb-2.5 border-b border-zinc-800 text-xs font-semibold text-zinc-400 uppercase tracking-wider">
           <span className="flex items-center gap-1.5">
             <Palette className="w-4 h-4 text-blue-400" />
-            <span>Screen Grade & Blur</span>
+            <span>Master Screen Grade</span>
           </span>
           <button
-            onClick={() => {
+            type="button"
+            onClick={() =>
               updateProjectSettings({
                 screenBlur: 0,
+                masterExposure: 0,
                 masterBrightness: 100,
                 masterContrast: 100,
+                masterHighlights: 0,
+                masterShadows: 0,
                 masterSaturation: 100,
                 masterTemperature: 0,
+                masterTint: 0,
                 masterHue: 0,
-              });
-            }}
-            className="text-[10px] text-zinc-500 hover:text-zinc-300 flex items-center gap-1 transition-colors"
-            title="Reset Master Screen Grade"
+                masterSharpen: 0,
+                masterFade: 0,
+                masterVignette: 0,
+                masterGrain: 0,
+              })
+            }
+            className="text-[10px] text-zinc-500 hover:text-zinc-200 flex items-center gap-1 cursor-pointer"
           >
             <RotateCcw className="w-3 h-3" />
             <span>Reset</span>
           </button>
         </div>
 
-        <div className="mt-3.5 space-y-4 text-xs">
-          {/* Master Screen Blur Section */}
-          <div className="space-y-2">
-            <div className="flex items-center justify-between text-[11px] font-semibold text-zinc-400 uppercase tracking-wider">
-              <span className="flex items-center gap-1.5 text-blue-400">
+        <div className="mt-3.5 space-y-3 text-xs">
+          <div className="bg-zinc-900/60 p-2.5 rounded-md border border-zinc-800 space-y-2.5">
+            <div className="flex items-center justify-between text-[11px] text-blue-400 font-semibold uppercase tracking-wider">
+              <span className="flex items-center gap-1.5">
                 <Droplets className="w-3.5 h-3.5" />
                 <span>Screen Blur</span>
               </span>
-              <span className="font-mono text-zinc-200">{screenBlur}px</span>
+              <span className="font-mono text-zinc-200">{s.screenBlur ?? 0}px</span>
             </div>
-
-            <div className="bg-zinc-900/60 p-2.5 rounded-md border border-zinc-800 space-y-2">
-              <input
-                type="range"
-                min="0"
-                max="40"
-                step="1"
-                value={screenBlur}
-                {...rangeTx('Adjust screen blur')}
-                onChange={(e) => updateProjectSettings({ screenBlur: parseInt(e.target.value) || 0 })}
-                className="w-full h-1 bg-zinc-800 rounded appearance-none cursor-pointer accent-blue-500"
-              />
-
-              <div className="flex items-center justify-between pt-1 text-[10px] text-zinc-500 font-mono">
-                <button
-                  onClick={() => updateProjectSettings({ screenBlur: 0 })}
-                  className="px-1.5 py-0.5 rounded bg-zinc-950 hover:bg-zinc-800 hover:text-zinc-200"
-                >
-                  Clear (0px)
-                </button>
-                <button
-                  onClick={() => updateProjectSettings({ screenBlur: 8 })}
-                  className="px-1.5 py-0.5 rounded bg-zinc-950 hover:bg-zinc-800 hover:text-zinc-200"
-                >
-                  Soft (8px)
-                </button>
-                <button
-                  onClick={() => updateProjectSettings({ screenBlur: 18 })}
-                  className="px-1.5 py-0.5 rounded bg-zinc-950 hover:bg-zinc-800 hover:text-zinc-200"
-                >
-                  Frosted (18px)
-                </button>
-                <button
-                  onClick={() => updateProjectSettings({ screenBlur: 32 })}
-                  className="px-1.5 py-0.5 rounded bg-zinc-950 hover:bg-zinc-800 hover:text-zinc-200"
-                >
-                  Heavy (32px)
-                </button>
-              </div>
-            </div>
+            <input
+              type="range"
+              min="0"
+              max="40"
+              step="1"
+              value={s.screenBlur ?? 0}
+              {...rangeTx('Adjust screen blur')}
+              onChange={(e) => updateProjectSettings({ screenBlur: parseInt(e.target.value, 10) || 0 })}
+              className="w-full h-1 bg-zinc-800 rounded appearance-none cursor-pointer accent-blue-500"
+            />
           </div>
 
-          {/* Master Screen Color Grading Section */}
-          <div className="space-y-2">
-            <div className="flex items-center justify-between text-[11px] font-semibold text-zinc-400 uppercase tracking-wider">
-              <span className="flex items-center gap-1.5 text-amber-400">
-                <Sun className="w-3.5 h-3.5" />
-                <span>Canvas Color Grading</span>
-              </span>
-            </div>
-
-            <div className="bg-zinc-900/60 p-2.5 rounded-md border border-zinc-800 space-y-2.5">
-              {/* Exposure / Brightness */}
-              <div>
-                <div className="flex justify-between text-[11px] text-zinc-400 mb-1">
-                  <span>Master Exposure</span>
-                  <span className="font-mono text-zinc-200">{masterBrightness}%</span>
+          <div className="bg-zinc-900/60 p-2.5 rounded-md border border-zinc-800 space-y-2.5">
+            {(
+              [
+                { key: 'masterExposure', label: 'Exposure', min: -2, max: 2, step: 0.05, def: 0 },
+                { key: 'masterBrightness', label: 'Brightness', min: 30, max: 200, step: 1, def: 100 },
+                { key: 'masterContrast', label: 'Contrast', min: 30, max: 200, step: 1, def: 100 },
+                { key: 'masterSaturation', label: 'Saturation', min: 0, max: 240, step: 1, def: 100 },
+                { key: 'masterHighlights', label: 'Highlights', min: -100, max: 100, step: 1, def: 0 },
+                { key: 'masterShadows', label: 'Shadows', min: -100, max: 100, step: 1, def: 0 },
+                { key: 'masterTemperature', label: 'Temperature', min: -100, max: 100, step: 1, def: 0 },
+                { key: 'masterSharpen', label: 'Sharpen', min: 0, max: 100, step: 1, def: 0 },
+                { key: 'masterFade', label: 'Fade', min: 0, max: 100, step: 1, def: 0 },
+                { key: 'masterVignette', label: 'Vignette', min: 0, max: 100, step: 1, def: 0 },
+                { key: 'masterGrain', label: 'Grain', min: 0, max: 100, step: 1, def: 0 },
+              ] as const
+            ).map((cfg) => {
+              const val = (s[cfg.key] as number | undefined) ?? cfg.def;
+              return (
+                <div key={cfg.key}>
+                  <div className="flex justify-between text-[11px] text-zinc-400 mb-1">
+                    <span>{cfg.label}</span>
+                    <span className="font-mono text-zinc-200">
+                      {cfg.step < 1 ? val.toFixed(2) : Math.round(val)}
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={cfg.min}
+                    max={cfg.max}
+                    step={cfg.step}
+                    value={val}
+                    {...rangeTx(`Adjust ${cfg.label}`)}
+                    onChange={(e) =>
+                      updateProjectSettings({ [cfg.key]: parseFloat(e.target.value) })
+                    }
+                    className="w-full h-1 bg-zinc-800 rounded appearance-none cursor-pointer accent-blue-500"
+                  />
                 </div>
-                <input
-                  type="range"
-                  min="40"
-                  max="180"
-                  value={masterBrightness}
-                  {...rangeTx('Adjust master exposure')}
-                  onChange={(e) => updateProjectSettings({ masterBrightness: parseInt(e.target.value) })}
-                  className="w-full h-1 bg-zinc-800 rounded appearance-none cursor-pointer accent-blue-500"
-                />
-              </div>
-
-              {/* Contrast */}
-              <div>
-                <div className="flex justify-between text-[11px] text-zinc-400 mb-1">
-                  <span>Master Contrast</span>
-                  <span className="font-mono text-zinc-200">{masterContrast}%</span>
-                </div>
-                <input
-                  type="range"
-                  min="40"
-                  max="200"
-                  value={masterContrast}
-                  {...rangeTx('Adjust master contrast')}
-                  onChange={(e) => updateProjectSettings({ masterContrast: parseInt(e.target.value) })}
-                  className="w-full h-1 bg-zinc-800 rounded appearance-none cursor-pointer accent-blue-500"
-                />
-              </div>
-
-              {/* Saturation */}
-              <div>
-                <div className="flex justify-between text-[11px] text-zinc-400 mb-1">
-                  <span>Master Saturation</span>
-                  <span className="font-mono text-zinc-200">{masterSaturation}%</span>
-                </div>
-                <input
-                  type="range"
-                  min="0"
-                  max="220"
-                  value={masterSaturation}
-                  {...rangeTx('Adjust master saturation')}
-                  onChange={(e) => updateProjectSettings({ masterSaturation: parseInt(e.target.value) })}
-                  className="w-full h-1 bg-zinc-800 rounded appearance-none cursor-pointer accent-blue-500"
-                />
-              </div>
-
-              {/* Temperature */}
-              <div>
-                <div className="flex justify-between text-[11px] text-zinc-400 mb-1">
-                  <span>Color Temperature</span>
-                  <span className="font-mono text-zinc-200">{masterTemperature > 0 ? `+${masterTemperature}` : masterTemperature}</span>
-                </div>
-                <input
-                  type="range"
-                  min="-100"
-                  max="100"
-                  value={masterTemperature}
-                  {...rangeTx('Adjust color temperature')}
-                  onChange={(e) => updateProjectSettings({ masterTemperature: parseInt(e.target.value) })}
-                  className="w-full h-1 bg-gradient-to-r from-cyan-600 via-zinc-700 to-amber-500 rounded appearance-none cursor-pointer"
-                />
-              </div>
-
-              {/* Hue Rotation */}
-              <div>
-                <div className="flex justify-between text-[11px] text-zinc-400 mb-1">
-                  <span>Master Hue Shift</span>
-                  <span className="font-mono text-zinc-200">{masterHue}°</span>
-                </div>
-                <input
-                  type="range"
-                  min="-180"
-                  max="180"
-                  value={masterHue}
-                  {...rangeTx('Adjust master hue')}
-                  onChange={(e) => updateProjectSettings({ masterHue: parseInt(e.target.value) })}
-                  className="w-full h-1 bg-gradient-to-r from-rose-500 via-emerald-500 via-blue-500 to-rose-500 rounded appearance-none cursor-pointer"
-                />
-              </div>
-            </div>
+              );
+            })}
           </div>
 
-          {/* Project Details Card */}
-          <div className="bg-zinc-900/60 p-3 rounded-md border border-zinc-800 space-y-2">
-            <div className="flex items-center justify-between">
-              <span className="font-semibold text-zinc-200 text-xs">{project.name}</span>
-              <Badge variant="outline" className="border-zinc-700 text-zinc-300 font-mono text-[10px]">
-                {project.settings.aspectRatio}
-              </Badge>
-            </div>
-            <div className="text-zinc-400 text-[11px] space-y-1 font-mono">
-              <div className="flex justify-between">
-                <span className="text-zinc-500">CANVAS:</span>
-                <span className="text-zinc-300">{project.settings.width}x{project.settings.height}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-zinc-500">FPS:</span>
-                <span className="text-zinc-300">{project.settings.fps} FPS</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-zinc-500">DURATION:</span>
-                <span className="text-zinc-300">{project.timeline.duration}s</span>
-              </div>
-            </div>
-          </div>
-
-          <div className="p-2.5 rounded-md border border-zinc-800/80 bg-zinc-900/30 text-[11px] text-zinc-500 leading-relaxed text-center">
-            Click any clip on the timeline to grade its specific clip layers, adjust transform gizmos, or edit typography.
+          <div className="p-2.5 rounded-md border border-zinc-800/80 bg-zinc-900/30 text-[11px] text-zinc-500 text-center">
+            Select a clip on the monitor or timeline to edit its Color, Masks, Speed Curve, or Animations.
           </div>
         </div>
       </aside>
     );
   }
 
-  // --- CLIP SPECIFIC INSPECTOR ---
-  const { transform, effects = [] } = selectedClip;
-  const brightness = effects.find(e => (e.type === 'brightness' || e.id === 'brightness') && e.enabled)?.value ?? 100;
-  const contrast = effects.find(e => (e.type === 'contrast' || e.id === 'contrast') && e.enabled)?.value ?? 100;
-  const saturation = effects.find(e => (e.type === 'saturation' || e.id === 'saturation') && e.enabled)?.value ?? 100;
-  const blur = effects.find(e => (e.type === 'blur' || e.id === 'blur') && e.enabled)?.value ?? 0;
-  const temperature = effects.find(e => (e.type === 'temperature' || e.id === 'temperature') && e.enabled)?.value ?? 0;
-  const hue = effects.find(e => (e.type === 'hue' || e.id === 'hue') && e.enabled)?.value ?? 0;
-  const sepia = effects.find(e => (e.type === 'sepia' || e.id === 'sepia') && e.enabled)?.value ?? 0;
-  const grayscale = effects.find(e => (e.type === 'grayscale' || e.id === 'grayscale') && e.enabled)?.value ?? 0;
-  const invert = effects.find(e => (e.type === 'invert' || e.id === 'invert') && e.enabled)?.value ?? 0;
+  const isVisual =
+    effectiveClip &&
+    (effectiveClip.type === 'video' || effectiveClip.type === 'image' || effectiveClip.type === 'sticker');
+  const isTimeScaled =
+    effectiveClip && (effectiveClip.type === 'video' || effectiveClip.type === 'audio');
 
-  // Preset LUTs
-  const applyLutPreset = (preset: 'teal_orange' | 'cyberpunk' | 'vintage' | 'noir' | 'vibrant' | 'dreamy' | 'reset') => {
-    switch (preset) {
-      case 'teal_orange':
-        batchUpdateClipEffects(selectedClip.id, {
-          brightness: 102,
-          contrast: 130,
-          saturation: 125,
-          temperature: 30,
-          hue: -12,
-          sepia: 0,
-          grayscale: 0,
-          invert: 0,
-          blur: 0,
-        });
-        break;
-      case 'cyberpunk':
-        batchUpdateClipEffects(selectedClip.id, {
-          brightness: 110,
-          contrast: 145,
-          saturation: 165,
-          temperature: -25,
-          hue: 45,
-          sepia: 0,
-          grayscale: 0,
-          invert: 0,
-          blur: 0,
-        });
-        break;
-      case 'vintage':
-        batchUpdateClipEffects(selectedClip.id, {
-          brightness: 98,
-          contrast: 115,
-          saturation: 90,
-          temperature: 35,
-          hue: 0,
-          sepia: 35,
-          grayscale: 0,
-          invert: 0,
-          blur: 0,
-        });
-        break;
-      case 'noir':
-        batchUpdateClipEffects(selectedClip.id, {
-          brightness: 95,
-          contrast: 155,
-          saturation: 0,
-          temperature: 0,
-          hue: 0,
-          sepia: 0,
-          grayscale: 100,
-          invert: 0,
-          blur: 0,
-        });
-        break;
-      case 'vibrant':
-        batchUpdateClipEffects(selectedClip.id, {
-          brightness: 106,
-          contrast: 115,
-          saturation: 145,
-          temperature: 5,
-          hue: 0,
-          sepia: 0,
-          grayscale: 0,
-          invert: 0,
-          blur: 0,
-        });
-        break;
-      case 'dreamy':
-        batchUpdateClipEffects(selectedClip.id, {
-          brightness: 112,
-          contrast: 92,
-          saturation: 95,
-          temperature: 15,
-          hue: 0,
-          sepia: 10,
-          grayscale: 0,
-          invert: 0,
-          blur: 2,
-        });
-        break;
-      case 'reset':
-      default:
-        batchUpdateClipEffects(selectedClip.id, {
-          brightness: 100,
-          contrast: 100,
-          saturation: 100,
-          temperature: 0,
-          hue: 0,
-          sepia: 0,
-          grayscale: 0,
-          invert: 0,
-          blur: 0,
-        });
-        break;
-    }
-  };
+  const availableTabs: Array<{ id: InspectorTabId; label: string }> = [
+    ...(project.mode === 'clipping' ? [{ id: 'framer' as const, label: 'Framer' }] : []),
+    ...(effectiveClip ? [{ id: 'basic' as const, label: 'Basic' }] : []),
+    ...(isVisual ? [{ id: 'color' as const, label: 'Color' }] : []),
+    ...(isVisual ? [{ id: 'mask' as const, label: 'Mask' }] : []),
+    ...(effectiveClip && effectiveClip.type !== 'audio'
+      ? [{ id: 'animate' as const, label: 'Animate' }]
+      : []),
+    ...(isTimeScaled ? [{ id: 'speed' as const, label: 'Speed' }] : []),
+  ];
+
+  const currentTab: InspectorTabId = availableTabs.some((t) => t.id === activeTab)
+    ? activeTab
+    : (availableTabs[0]?.id ?? 'basic');
 
   return (
-    <aside className="w-full h-full bg-zinc-950 p-3.5 flex flex-col text-zinc-300 select-none overflow-y-auto custom-scrollbar">
-      {/* Clip Header Title & Quick Actions */}
-      <div className="flex items-center justify-between pb-2.5 border-b border-zinc-800">
-        <div className="flex items-center gap-2 min-w-0">
-          <Badge variant="secondary" className="text-[10px] uppercase font-mono bg-zinc-800 text-zinc-300 border-zinc-700">
-            {selectedClip.type}
-          </Badge>
-          <span className="text-xs font-semibold text-zinc-100 truncate" title={selectedClip.name}>
-            {selectedClip.name}
-          </span>
-        </div>
+    <aside className="w-full h-full bg-zinc-950 flex flex-col text-zinc-300 select-none overflow-hidden">
+      {/* Clip Header & Quick Actions */}
+      {effectiveClip && (
+        <div className="px-3.5 pt-3 pb-2 border-b border-zinc-800 flex items-center justify-between gap-2 shrink-0">
+          <div className="flex items-center gap-2 min-w-0">
+            <Badge
+              variant="secondary"
+              className="text-[10px] uppercase font-mono bg-zinc-800 text-zinc-300 border-zinc-700 shrink-0"
+            >
+              {effectiveClip.type}
+            </Badge>
+            <span className="text-xs font-semibold text-zinc-100 truncate" title={effectiveClip.name}>
+              {effectiveClip.name}
+            </span>
+          </div>
 
-        <div className="flex items-center gap-1">
-          {selectedClip.type === 'video' && (
+          <div className="flex items-center gap-0.5 shrink-0">
+            {effectiveClip.type === 'video' && (
+              <Button
+                size="icon"
+                variant="ghost"
+                onClick={() => extractAudioFromClip(effectiveClip.id)}
+                title="Extract Audio to Track A1"
+                className="h-6 w-6 text-zinc-400 hover:text-emerald-400 cursor-pointer"
+              >
+                <Volume2 className="w-3.5 h-3.5" />
+              </Button>
+            )}
             <Button
               size="icon"
               variant="ghost"
-              onClick={() => extractAudioFromClip(selectedClip.id)}
-              title="Extract Audio to Track A1"
-              className="h-6 w-6 text-zinc-400 hover:text-emerald-400"
+              onClick={() => splitClipAtPlayhead(effectiveClip.id)}
+              title="Split at Playhead (Ctrl+K)"
+              className="h-6 w-6 text-zinc-400 hover:text-zinc-100 cursor-pointer"
             >
-              <ArrowDownToLine className="w-3.5 h-3.5" />
+              <Scissors className="w-3.5 h-3.5" />
             </Button>
-          )}
-          <Button
-            size="icon"
-            variant="ghost"
-            onClick={() => splitClipAtPlayhead(selectedClip.id)}
-            title="Split at Playhead (Ctrl+K)"
-            className="h-6 w-6 text-zinc-400 hover:text-zinc-100"
-          >
-            <Scissors className="w-3.5 h-3.5" />
-          </Button>
-          <Button
-            size="icon"
-            variant="ghost"
-            onClick={() => deleteClip(selectedClip.id)}
-            title="Delete Selected Clip (Del)"
-            className="h-6 w-6 text-zinc-400 hover:text-red-400"
-          >
-            <Trash2 className="w-3.5 h-3.5" />
-          </Button>
+            <Button
+              size="icon"
+              variant="ghost"
+              onClick={() => deleteClip(effectiveClip.id)}
+              title="Delete Selected Clip (Del)"
+              className="h-6 w-6 text-zinc-400 hover:text-red-400 cursor-pointer"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+            </Button>
+          </div>
         </div>
+      )}
+
+      {/* Inspector Sub-Tab Navigation */}
+      <div className="flex items-center gap-1 border-b border-zinc-800 bg-zinc-900/60 px-2 py-1.5 overflow-x-auto custom-scrollbar shrink-0">
+        {availableTabs.map((t) => (
+          <button
+            key={t.id}
+            type="button"
+            onClick={() => setActiveTab(t.id)}
+            className={`px-2 py-1 rounded text-[11px] font-medium transition-colors cursor-pointer whitespace-nowrap ${
+              currentTab === t.id
+                ? 'bg-zinc-800 text-white shadow-xs'
+                : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/40'
+            }`}
+          >
+            {t.label}
+          </button>
+        ))}
       </div>
 
-      <div className="mt-3.5 space-y-4 text-xs">
-        {/* Transform Matrix Section */}
-        <div className="space-y-2">
-          <div className="flex items-center justify-between text-[11px] font-semibold text-zinc-400 uppercase tracking-wider">
-            <span className="flex items-center gap-1.5">
-              <Maximize2 className="w-3.5 h-3.5 text-blue-400" />
-              <span>Transform</span>
-            </span>
-            <button
-              onClick={() => updateClipTransform(selectedClip.id, { scale: 1, rotation: 0, x: 0, y: 0 })}
-              className="text-[10px] text-zinc-500 hover:text-zinc-300 transition-colors"
-            >
-              Reset
-            </button>
-          </div>
-
-          <div className="bg-zinc-900/60 p-2.5 rounded-md border border-zinc-800 space-y-2.5">
-            {/* Scale Slider */}
-            <div>
-              <div className="flex justify-between text-[11px] text-zinc-400 mb-1">
-                <span>Scale</span>
-                <span className="font-mono text-zinc-200">{Math.round(transform.scale * 100)}%</span>
-              </div>
-              <input
-                type="range"
-                min="0.2"
-                max="3"
-                step="0.05"
-                value={transform.scale}
-                {...rangeTx('Adjust clip scale')}
-                onChange={(e) => updateClipTransform(selectedClip.id, { scale: parseFloat(e.target.value) })}
-                className="w-full h-1 bg-zinc-800 rounded appearance-none cursor-pointer accent-blue-500"
-              />
-            </div>
-
-            {/* Rotation Slider */}
-            <div>
-              <div className="flex justify-between text-[11px] text-zinc-400 mb-1">
-                <span>Rotation</span>
-                <span className="font-mono text-zinc-200">{transform.rotation}°</span>
-              </div>
-              <input
-                type="range"
-                min="-180"
-                max="180"
-                value={transform.rotation}
-                {...rangeTx('Adjust clip rotation')}
-                onChange={(e) => updateClipTransform(selectedClip.id, { rotation: parseInt(e.target.value) })}
-                className="w-full h-1 bg-zinc-800 rounded appearance-none cursor-pointer accent-blue-500"
-              />
-            </div>
-
-            {/* Position X / Y */}
-            <div className="grid grid-cols-2 gap-2 pt-1 border-t border-zinc-800">
-              <div>
-                <label className="text-[10px] text-zinc-500 font-mono">POS X</label>
-                <input
-                  type="number"
-                  value={transform.x}
-                  onChange={(e) => updateClipTransform(selectedClip.id, { x: parseInt(e.target.value) || 0 })}
-                  className="w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-1 text-xs text-zinc-200 font-mono mt-0.5 focus:border-zinc-600 focus:outline-hidden"
-                />
-              </div>
-              <div>
-                <label className="text-[10px] text-zinc-500 font-mono">POS Y</label>
-                <input
-                  type="number"
-                  value={transform.y}
-                  onChange={(e) => updateClipTransform(selectedClip.id, { y: parseInt(e.target.value) || 0 })}
-                  className="w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-1 text-xs text-zinc-200 font-mono mt-0.5 focus:border-zinc-600 focus:outline-hidden"
-                />
-              </div>
-            </div>
-          </div>
-        </div>
-
-        {/* CapCut-Style Image Controls */}
-        {selectedClip.type === 'image' && (
-          <div className="space-y-2">
-            <div className="flex items-center justify-between text-[11px] font-semibold text-zinc-400 uppercase tracking-wider">
-              <span className="flex items-center gap-1.5 text-purple-400">
-                <Layers className="w-3.5 h-3.5" />
-                <span>CapCut Image Styling</span>
-              </span>
-            </div>
-
-            <div className="bg-zinc-900/60 p-2.5 rounded-md border border-zinc-800 space-y-3">
-              {/* Fit Mode */}
-              <div>
-                <label className="text-[10px] text-zinc-400 block mb-1">Image Fit Mode</label>
-                <div className="grid grid-cols-3 gap-1">
-                  {(['cover', 'contain', 'fill'] as const).map((mode) => (
-                    <button
-                      key={mode}
-                      onClick={() => updateClip(selectedClip.id, { fitMode: mode })}
-                      className={`py-1 text-[10px] capitalize rounded border transition-colors ${
-                        (selectedClip.fitMode || 'cover') === mode
-                          ? 'bg-purple-600/30 border-purple-500 text-purple-300 font-semibold'
-                          : 'bg-zinc-950 border-zinc-800 text-zinc-400 hover:text-zinc-200'
-                      }`}
-                    >
-                      {mode}
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              {/* Corner Radius */}
-              <div>
-                <div className="flex justify-between text-[10px] text-zinc-400 mb-1">
-                  <span>Rounded Corners</span>
-                  <span className="font-mono text-zinc-200">{selectedClip.borderRadius ?? 0}px</span>
-                </div>
-                <input
-                  type="range"
-                  min="0"
-                  max="60"
-                  step="1"
-                  value={selectedClip.borderRadius ?? 0}
-                  {...rangeTx('Adjust rounded corners')}
-                  onChange={(e) => updateClip(selectedClip.id, { borderRadius: parseInt(e.target.value) || 0 }, { coalesceKey: 'image-radius' })}
-                  className="w-full h-1 bg-zinc-800 rounded appearance-none cursor-pointer accent-purple-500"
-                />
-                <div className="flex items-center justify-between pt-1 text-[9px] text-zinc-500 font-mono">
-                  <button
-                    onClick={() => updateClip(selectedClip.id, { borderRadius: 0 })}
-                    className="px-1.5 py-0.5 rounded bg-zinc-950 hover:bg-zinc-800 hover:text-zinc-200"
-                  >
-                    Sharp
-                  </button>
-                  <button
-                    onClick={() => updateClip(selectedClip.id, { borderRadius: 12 })}
-                    className="px-1.5 py-0.5 rounded bg-zinc-950 hover:bg-zinc-800 hover:text-zinc-200"
-                  >
-                    Smooth (12px)
-                  </button>
-                  <button
-                    onClick={() => updateClip(selectedClip.id, { borderRadius: 28 })}
-                    className="px-1.5 py-0.5 rounded bg-zinc-950 hover:bg-zinc-800 hover:text-zinc-200"
-                  >
-                    Card (28px)
-                  </button>
-                  <button
-                    onClick={() => updateClip(selectedClip.id, { borderRadius: 60 })}
-                    className="px-1.5 py-0.5 rounded bg-zinc-950 hover:bg-zinc-800 hover:text-zinc-200"
-                  >
-                    Capsule
-                  </button>
-                </div>
-              </div>
-
-              {/* Border Stroke */}
-              <div>
-                <div className="flex justify-between text-[10px] text-zinc-400 mb-1">
-                  <span>Border Stroke</span>
-                  <span className="font-mono text-zinc-200">{selectedClip.borderWidth ?? 0}px</span>
-                </div>
-                <input
-                  type="range"
-                  min="0"
-                  max="12"
-                  value={selectedClip.borderWidth ?? 0}
-                  {...rangeTx('Adjust border stroke')}
-                  onChange={(e) => updateClip(selectedClip.id, { borderWidth: parseInt(e.target.value) || 0 }, { coalesceKey: 'image-border' })}
-                  className="w-full h-1 bg-zinc-800 rounded appearance-none cursor-pointer accent-purple-500"
-                />
-
-                {(selectedClip.borderWidth ?? 0) > 0 && (
-                  <div className="flex items-center justify-between pt-2">
-                    <span className="text-[10px] text-zinc-500">Border Color</span>
-                    <div className="flex items-center gap-1.5">
-                      {['#ffffff', '#38bdf8', '#a855f7', '#eab308', '#ef4444', '#000000'].map((color) => (
-                        <button
-                          key={color}
-                          onClick={() => updateClip(selectedClip.id, { borderColor: color })}
-                          className={`w-4 h-4 rounded-full border ${
-                            (selectedClip.borderColor || '#ffffff') === color
-                              ? 'border-white scale-110'
-                              : 'border-zinc-700'
-                          }`}
-                          style={{ backgroundColor: color }}
-                        />
-                      ))}
-                    </div>
-                  </div>
-                )}
-              </div>
-
-              {/* Drop Shadow */}
-              <div className="flex items-center justify-between pt-1 border-t border-zinc-800">
-                <span className="text-[10px] text-zinc-400">CapCut Drop Shadow</span>
-                <button
-                  onClick={() => updateClip(selectedClip.id, { dropShadow: !selectedClip.dropShadow })}
-                  className={`px-2 py-0.5 rounded text-[10px] font-medium border transition-colors ${
-                    selectedClip.dropShadow
-                      ? 'bg-purple-600/40 border-purple-500 text-purple-300'
-                      : 'bg-zinc-950 border-zinc-800 text-zinc-500 hover:text-zinc-300'
-                  }`}
-                >
-                  {selectedClip.dropShadow ? 'Active' : 'Off'}
-                </button>
-              </div>
-            </div>
-          </div>
+      {/* Sub-Tab Panel Content */}
+      <div className="flex-1 overflow-y-auto p-3.5 custom-scrollbar text-xs">
+        {currentTab === 'framer' && (
+          <FramerTab
+            framerSettings={framerSettings}
+            updateFramerSettings={updateFramerSettings}
+            updateFramerBox={updateFramerBox}
+            sendClipperToEditor={sendClipperToEditor}
+            beginHistoryTransaction={beginHistoryTransaction}
+            endHistoryTransaction={endHistoryTransaction}
+            rangeTx={rangeTx}
+          />
         )}
 
-        {/* Text Properties Section */}
-        {selectedClip.type === 'text' && (
-          <div className="space-y-2">
-            <div className="flex items-center gap-1.5 text-[11px] font-semibold text-zinc-400 uppercase tracking-wider">
-              <Type className="w-3.5 h-3.5 text-blue-400" />
-              <span>Typography</span>
-            </div>
-
-            <div className="bg-zinc-900/60 p-2.5 rounded-md border border-zinc-800 space-y-2.5">
-              <div>
-                <label className="text-[10px] text-zinc-500 font-mono">CAPTION CONTENT</label>
-                <input
-                  type="text"
-                  value={selectedClip.textContent || ''}
-                  onChange={(e) => updateClip(selectedClip.id, { textContent: e.target.value }, { coalesceKey: `text-content:${selectedClip.id}` })}
-                  className="w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-1 text-xs text-zinc-200 mt-1 focus:border-zinc-600 focus:outline-hidden"
-                />
-              </div>
-
-              <div className="grid grid-cols-2 gap-2">
-                <div>
-                  <label className="text-[10px] text-zinc-500 font-mono">FONT SIZE</label>
-                  <input
-                    type="number"
-                    value={selectedClip.fontSize || 32}
-                    onChange={(e) => updateClip(selectedClip.id, { fontSize: parseInt(e.target.value) || 24 }, { coalesceKey: `text-size:${selectedClip.id}` })}
-                    className="w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-1 text-xs text-zinc-200 font-mono mt-0.5 focus:border-zinc-600 focus:outline-hidden"
-                  />
-                </div>
-                <div>
-                  <label className="text-[10px] text-zinc-500 font-mono">COLOR</label>
-                  <input
-                    type="color"
-                    value={selectedClip.textColor || '#ffffff'}
-                    onChange={(e) => updateClip(selectedClip.id, { textColor: e.target.value }, { coalesceKey: `text-color:${selectedClip.id}` })}
-                    className="w-full h-7 bg-zinc-950 border border-zinc-800 rounded p-0.5 mt-0.5 cursor-pointer"
-                  />
-                </div>
-              </div>
-            </div>
-          </div>
+        {currentTab === 'color' && effectiveClip && (
+          <ColorTab
+            clip={effectiveClip}
+            onAdjustEffect={(cid, t, v) => updateClipEffect(cid, t, v)}
+            onApplyPreset={applyClipFilterPreset}
+            onResetAll={resetClipGrading}
+            rangeTx={rangeTx}
+          />
         )}
 
-        {/* Comprehensive Color Grading & Screen Blur Section for Video & Images */}
-        {(selectedClip.type === 'video' || selectedClip.type === 'image') && (
-          <div className="space-y-3">
-            {/* Screen / Clip Blur Control */}
-            <div className="space-y-1.5">
-              <div className="flex items-center justify-between text-[11px] font-semibold text-zinc-400 uppercase tracking-wider">
-                <span className="flex items-center gap-1.5 text-blue-400">
-                  <Droplets className="w-3.5 h-3.5" />
-                  <span>Screen & Clip Blur</span>
-                </span>
-                <span className="font-mono text-zinc-200">{blur}px</span>
-              </div>
+        {currentTab === 'mask' && effectiveClip && (
+          <MaskTab
+            clip={effectiveClip}
+            onUpdateMask={(cid, u) => updateClipMask(cid, u)}
+            rangeTx={rangeTx}
+          />
+        )}
 
-              <div className="bg-zinc-900/60 p-2.5 rounded-md border border-zinc-800 space-y-2">
-                <input
-                  type="range"
-                  min="0"
-                  max="40"
-                  step="1"
-                  value={blur}
-                  {...rangeTx('Adjust clip blur')}
-                  onChange={(e) => updateClipEffect(selectedClip.id, 'blur', parseInt(e.target.value) || 0)}
-                  className="w-full h-1 bg-zinc-800 rounded appearance-none cursor-pointer accent-blue-500"
-                />
+        {currentTab === 'animate' && effectiveClip && (
+          <AnimateTab
+            clip={effectiveClip}
+            onUpdateAnimation={updateClipAnimation}
+            rangeTx={rangeTx}
+          />
+        )}
 
-                <div className="flex items-center justify-between text-[10px] text-zinc-500 font-mono">
-                  <button
-                    onClick={() => updateClipEffect(selectedClip.id, 'blur', 0)}
-                    className="px-1.5 py-0.5 rounded bg-zinc-950 hover:bg-zinc-800 hover:text-zinc-200"
-                  >
-                    0px
-                  </button>
-                  <button
-                    onClick={() => updateClipEffect(selectedClip.id, 'blur', 6)}
-                    className="px-1.5 py-0.5 rounded bg-zinc-950 hover:bg-zinc-800 hover:text-zinc-200"
-                  >
-                    6px
-                  </button>
-                  <button
-                    onClick={() => updateClipEffect(selectedClip.id, 'blur', 14)}
-                    className="px-1.5 py-0.5 rounded bg-zinc-950 hover:bg-zinc-800 hover:text-zinc-200"
-                  >
-                    14px
-                  </button>
-                  <button
-                    onClick={() => updateClipEffect(selectedClip.id, 'blur', 28)}
-                    className="px-1.5 py-0.5 rounded bg-zinc-950 hover:bg-zinc-800 hover:text-zinc-200"
-                  >
-                    28px
-                  </button>
-                </div>
-              </div>
-            </div>
+        {currentTab === 'speed' && effectiveClip && (
+          <SpeedGraphTab
+            clip={effectiveClip}
+            onUpdateSpeedCurve={updateClipSpeedCurve}
+            beginTx={beginHistoryTransaction}
+            endTx={endHistoryTransaction}
+          />
+        )}
 
-            {/* Cinematic 1-Click LUT Presets */}
-            <div className="space-y-1.5">
-              <span className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider flex items-center gap-1.5">
-                <Sparkles className="w-3.5 h-3.5 text-purple-400" />
-                <span>Cinematic Color Presets</span>
-              </span>
-
-              <div className="grid grid-cols-3 gap-1.5">
-                <button
-                  type="button"
-                  onClick={() => applyLutPreset('teal_orange')}
-                  className="p-1.5 rounded bg-zinc-900 border border-zinc-800 hover:border-blue-500 hover:bg-blue-950/40 text-[10px] font-medium text-zinc-300 text-center transition-colors"
-                >
-                  Teal & Orange
-                </button>
-                <button
-                  type="button"
-                  onClick={() => applyLutPreset('cyberpunk')}
-                  className="p-1.5 rounded bg-zinc-900 border border-zinc-800 hover:border-pink-500 hover:bg-pink-950/40 text-[10px] font-medium text-zinc-300 text-center transition-colors"
-                >
-                  Cyberpunk
-                </button>
-                <button
-                  type="button"
-                  onClick={() => applyLutPreset('vintage')}
-                  className="p-1.5 rounded bg-zinc-900 border border-zinc-800 hover:border-amber-500 hover:bg-amber-950/40 text-[10px] font-medium text-zinc-300 text-center transition-colors"
-                >
-                  Vintage 90s
-                </button>
-                <button
-                  type="button"
-                  onClick={() => applyLutPreset('noir')}
-                  className="p-1.5 rounded bg-zinc-900 border border-zinc-800 hover:border-zinc-500 hover:bg-zinc-800 text-[10px] font-medium text-zinc-300 text-center transition-colors"
-                >
-                  Film Noir
-                </button>
-                <button
-                  type="button"
-                  onClick={() => applyLutPreset('vibrant')}
-                  className="p-1.5 rounded bg-zinc-900 border border-zinc-800 hover:border-emerald-500 hover:bg-emerald-950/40 text-[10px] font-medium text-zinc-300 text-center transition-colors"
-                >
-                  Viral Pop
-                </button>
-                <button
-                  type="button"
-                  onClick={() => applyLutPreset('dreamy')}
-                  className="p-1.5 rounded bg-zinc-900 border border-zinc-800 hover:border-indigo-500 hover:bg-indigo-950/40 text-[10px] font-medium text-zinc-300 text-center transition-colors"
-                >
-                  Dreamy Soft
-                </button>
-              </div>
-            </div>
-
-            {/* Fine-Tuning Color Grading Sliders */}
+        {currentTab === 'basic' && effectiveClip && (
+          <div className="space-y-4">
+            {/* Transform Matrix */}
             <div className="space-y-2">
               <div className="flex items-center justify-between text-[11px] font-semibold text-zinc-400 uppercase tracking-wider">
                 <span className="flex items-center gap-1.5">
-                  <Sun className="w-3.5 h-3.5 text-amber-400" />
-                  <span>Color Wheels & Grading</span>
+                  <Maximize2 className="w-3.5 h-3.5 text-blue-400" />
+                  <span>Transform</span>
                 </span>
                 <button
-                  onClick={() => applyLutPreset('reset')}
-                  className="text-[10px] text-zinc-500 hover:text-zinc-300 transition-colors"
+                  type="button"
+                  onClick={() =>
+                    updateClipTransform(effectiveClip.id, { scale: 1, rotation: 0, x: 0, y: 0, opacity: 1 })
+                  }
+                  className="text-[10px] text-zinc-500 hover:text-zinc-200 cursor-pointer"
                 >
                   Reset
                 </button>
               </div>
 
               <div className="bg-zinc-900/60 p-2.5 rounded-md border border-zinc-800 space-y-2.5">
-                {/* Exposure / Brightness */}
                 <div>
                   <div className="flex justify-between text-[11px] text-zinc-400 mb-1">
-                    <span>Exposure / Brightness</span>
-                    <span className="font-mono text-zinc-200">{brightness}%</span>
+                    <span>Scale</span>
+                    <span className="font-mono text-zinc-200">
+                      {Math.round(effectiveClip.transform.scale * 100)}%
+                    </span>
                   </div>
                   <input
                     type="range"
-                    min="30"
-                    max="180"
-                    value={brightness}
-                    {...rangeTx('Adjust brightness')}
-                    onChange={(e) => updateClipEffect(selectedClip.id, 'brightness', parseInt(e.target.value))}
+                    min="0.1"
+                    max="3"
+                    step="0.05"
+                    value={effectiveClip.transform.scale}
+                    {...rangeTx('Adjust clip scale')}
+                    onChange={(e) =>
+                      updateClipTransform(effectiveClip.id, { scale: parseFloat(e.target.value) })
+                    }
                     className="w-full h-1 bg-zinc-800 rounded appearance-none cursor-pointer accent-blue-500"
                   />
                 </div>
 
-                {/* Contrast */}
                 <div>
                   <div className="flex justify-between text-[11px] text-zinc-400 mb-1">
-                    <span>Contrast</span>
-                    <span className="font-mono text-zinc-200">{contrast}%</span>
-                  </div>
-                  <input
-                    type="range"
-                    min="40"
-                    max="200"
-                    value={contrast}
-                    {...rangeTx('Adjust contrast')}
-                    onChange={(e) => updateClipEffect(selectedClip.id, 'contrast', parseInt(e.target.value))}
-                    className="w-full h-1 bg-zinc-800 rounded appearance-none cursor-pointer accent-blue-500"
-                  />
-                </div>
-
-                {/* Saturation */}
-                <div>
-                  <div className="flex justify-between text-[11px] text-zinc-400 mb-1">
-                    <span>Saturation / Vibrance</span>
-                    <span className="font-mono text-zinc-200">{saturation}%</span>
-                  </div>
-                  <input
-                    type="range"
-                    min="0"
-                    max="220"
-                    value={saturation}
-                    {...rangeTx('Adjust saturation')}
-                    onChange={(e) => updateClipEffect(selectedClip.id, 'saturation', parseInt(e.target.value))}
-                    className="w-full h-1 bg-zinc-800 rounded appearance-none cursor-pointer accent-blue-500"
-                  />
-                </div>
-
-                {/* White Balance / Temperature */}
-                <div>
-                  <div className="flex justify-between text-[11px] text-zinc-400 mb-1">
-                    <span>Temperature (Cool / Warm)</span>
-                    <span className="font-mono text-zinc-200">{temperature > 0 ? `+${temperature}` : temperature}</span>
-                  </div>
-                  <input
-                    type="range"
-                    min="-100"
-                    max="100"
-                    value={temperature}
-                    {...rangeTx('Adjust temperature')}
-                    onChange={(e) => updateClipEffect(selectedClip.id, 'temperature', parseInt(e.target.value))}
-                    className="w-full h-1 bg-gradient-to-r from-cyan-600 via-zinc-700 to-amber-500 rounded appearance-none cursor-pointer"
-                  />
-                </div>
-
-                {/* Hue Rotation */}
-                <div>
-                  <div className="flex justify-between text-[11px] text-zinc-400 mb-1">
-                    <span>Hue Rotation</span>
-                    <span className="font-mono text-zinc-200">{hue}°</span>
+                    <span>Rotation</span>
+                    <span className="font-mono text-zinc-200">
+                      {effectiveClip.transform.rotation}°
+                    </span>
                   </div>
                   <input
                     type="range"
                     min="-180"
                     max="180"
-                    value={hue}
-                    {...rangeTx('Adjust hue rotation')}
-                    onChange={(e) => updateClipEffect(selectedClip.id, 'hue', parseInt(e.target.value))}
-                    className="w-full h-1 bg-gradient-to-r from-rose-500 via-emerald-500 via-blue-500 to-rose-500 rounded appearance-none cursor-pointer"
+                    value={effectiveClip.transform.rotation}
+                    {...rangeTx('Adjust clip rotation')}
+                    onChange={(e) =>
+                      updateClipTransform(effectiveClip.id, { rotation: parseInt(e.target.value, 10) })
+                    }
+                    className="w-full h-1 bg-zinc-800 rounded appearance-none cursor-pointer accent-blue-500"
                   />
                 </div>
 
-                {/* Advanced Sliders: Sepia, Grayscale, Invert */}
-                <div className="grid grid-cols-3 gap-2 pt-1 border-t border-zinc-800">
+                <div>
+                  <div className="flex justify-between text-[11px] text-zinc-400 mb-1">
+                    <span>Opacity</span>
+                    <span className="font-mono text-zinc-200">
+                      {Math.round((effectiveClip.transform.opacity ?? 1) * 100)}%
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min="0"
+                    max="1"
+                    step="0.02"
+                    value={effectiveClip.transform.opacity ?? 1}
+                    {...rangeTx('Adjust opacity')}
+                    onChange={(e) =>
+                      updateClipTransform(effectiveClip.id, { opacity: parseFloat(e.target.value) })
+                    }
+                    className="w-full h-1 bg-zinc-800 rounded appearance-none cursor-pointer accent-blue-500"
+                  />
+                </div>
+
+                <div className="grid grid-cols-2 gap-2 pt-1 border-t border-zinc-800">
                   <div>
-                    <label className="text-[10px] text-zinc-500 font-mono block mb-1">SEPIA</label>
+                    <label className="text-[10px] text-zinc-500 font-mono">POS X</label>
                     <input
-                      type="range"
-                      min="0"
-                      max="100"
-                      value={sepia}
-                      {...rangeTx('Adjust sepia')}
-                      onChange={(e) => updateClipEffect(selectedClip.id, 'sepia', parseInt(e.target.value))}
-                      className="w-full h-1 bg-zinc-800 rounded appearance-none cursor-pointer accent-amber-500"
+                      type="number"
+                      value={effectiveClip.transform.x}
+                      onChange={(e) =>
+                        updateClipTransform(effectiveClip.id, { x: parseInt(e.target.value, 10) || 0 })
+                      }
+                      className="w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-1 text-xs text-zinc-200 font-mono mt-0.5"
                     />
                   </div>
-
                   <div>
-                    <label className="text-[10px] text-zinc-500 font-mono block mb-1">B&W</label>
+                    <label className="text-[10px] text-zinc-500 font-mono">POS Y</label>
                     <input
-                      type="range"
-                      min="0"
-                      max="100"
-                      value={grayscale}
-                      {...rangeTx('Adjust B&W')}
-                      onChange={(e) => updateClipEffect(selectedClip.id, 'grayscale', parseInt(e.target.value))}
-                      className="w-full h-1 bg-zinc-800 rounded appearance-none cursor-pointer accent-zinc-400"
-                    />
-                  </div>
-
-                  <div>
-                    <label className="text-[10px] text-zinc-500 font-mono block mb-1">INVERT</label>
-                    <input
-                      type="range"
-                      min="0"
-                      max="100"
-                      value={invert}
-                      {...rangeTx('Adjust invert')}
-                      onChange={(e) => updateClipEffect(selectedClip.id, 'invert', parseInt(e.target.value))}
-                      className="w-full h-1 bg-zinc-800 rounded appearance-none cursor-pointer accent-purple-500"
+                      type="number"
+                      value={effectiveClip.transform.y}
+                      onChange={(e) =>
+                        updateClipTransform(effectiveClip.id, { y: parseInt(e.target.value, 10) || 0 })
+                      }
+                      className="w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-1 text-xs text-zinc-200 font-mono mt-0.5"
                     />
                   </div>
                 </div>
               </div>
             </div>
+
+            {/* Active FX Bundles */}
+            {isVisual && (
+              <div className="space-y-2">
+                <span className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider block">
+                  Active Shader FX
+                </span>
+                <div className="flex flex-wrap gap-1.5">
+                  {EFFECT_BUNDLES.map((fx) => {
+                    const active = Boolean(effectiveClip.layerEffects?.includes(fx.id));
+                    return (
+                      <button
+                        key={fx.id}
+                        type="button"
+                        onClick={() => toggleClipLayerEffect(effectiveClip.id, fx.id)}
+                        className={`px-2 py-1 rounded text-[10px] border transition-colors cursor-pointer ${
+                          active
+                            ? 'border-teal-500 bg-teal-950/50 text-teal-200'
+                            : 'border-zinc-800 bg-zinc-900 text-zinc-400 hover:text-zinc-200'
+                        }`}
+                      >
+                        {fx.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* Image Styling */}
+            {effectiveClip.type === 'image' && (
+              <div className="space-y-2 rounded-md border border-zinc-800 bg-zinc-900/60 p-2.5">
+                <div className="flex items-center gap-1.5 text-[11px] font-semibold text-purple-400 uppercase">
+                  <Layers className="w-3.5 h-3.5" />
+                  <span>Image Style</span>
+                </div>
+                <div className="grid grid-cols-3 gap-1">
+                  {(['cover', 'contain', 'fill'] as const).map((mode) => (
+                    <button
+                      key={mode}
+                      type="button"
+                      onClick={() => updateClip(effectiveClip.id, { fitMode: mode })}
+                      className={`py-1 text-[10px] capitalize rounded border cursor-pointer ${
+                        (effectiveClip.fitMode || 'cover') === mode
+                          ? 'bg-purple-600/30 border-purple-500 text-purple-200'
+                          : 'bg-zinc-950 border-zinc-800 text-zinc-400'
+                      }`}
+                    >
+                      {mode}
+                    </button>
+                  ))}
+                </div>
+                <div>
+                  <div className="flex justify-between text-[10px] text-zinc-400 mb-1">
+                    <span>Corner Radius</span>
+                    <span className="font-mono text-zinc-200">{effectiveClip.borderRadius ?? 0}px</span>
+                  </div>
+                  <input
+                    type="range"
+                    min="0"
+                    max="60"
+                    value={effectiveClip.borderRadius ?? 0}
+                    {...rangeTx('Adjust radius')}
+                    onChange={(e) =>
+                      updateClip(effectiveClip.id, { borderRadius: parseInt(e.target.value, 10) || 0 })
+                    }
+                    className="w-full h-1 bg-zinc-800 rounded appearance-none cursor-pointer accent-purple-500"
+                  />
+                </div>
+              </div>
+            )}
+
+            {/* Rich Typography Controls */}
+            {effectiveClip.type === 'text' && (
+              <div className="space-y-2.5 rounded-md border border-zinc-800 bg-zinc-900/60 p-2.5">
+                <div className="flex items-center gap-1.5 text-[11px] font-semibold text-blue-400 uppercase">
+                  <Type className="w-3.5 h-3.5" />
+                  <span>Rich Typography</span>
+                </div>
+                <div>
+                  <label className="text-[10px] text-zinc-500 font-mono">TEXT</label>
+                  <input
+                    type="text"
+                    value={effectiveClip.textContent || ''}
+                    onChange={(e) =>
+                      updateClip(effectiveClip.id, { textContent: e.target.value }, { coalesceKey: 'txt' })
+                    }
+                    className="w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-1 text-xs text-zinc-200 mt-0.5"
+                  />
+                </div>
+                <div className="grid grid-cols-3 gap-2">
+                  <div>
+                    <label className="text-[10px] text-zinc-500 font-mono">SIZE</label>
+                    <input
+                      type="number"
+                      value={effectiveClip.fontSize || 32}
+                      onChange={(e) =>
+                        updateClip(effectiveClip.id, { fontSize: parseInt(e.target.value, 10) || 24 })
+                      }
+                      className="w-full bg-zinc-950 border border-zinc-800 rounded px-1.5 py-1 text-xs font-mono mt-0.5"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[10px] text-zinc-500 font-mono">FILL</label>
+                    <input
+                      type="color"
+                      value={effectiveClip.textColor || '#ffffff'}
+                      onChange={(e) => updateClip(effectiveClip.id, { textColor: e.target.value })}
+                      className="w-full h-7 bg-zinc-950 border border-zinc-800 rounded p-0.5 mt-0.5 cursor-pointer"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[10px] text-zinc-500 font-mono">STROKE</label>
+                    <input
+                      type="color"
+                      value={effectiveClip.strokeColor || '#000000'}
+                      onChange={(e) => updateClip(effectiveClip.id, { strokeColor: e.target.value })}
+                      className="w-full h-7 bg-zinc-950 border border-zinc-800 rounded p-0.5 mt-0.5 cursor-pointer"
+                    />
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <div className="flex justify-between text-[10px] text-zinc-400">
+                      <span>Stroke Width</span>
+                      <span className="font-mono">{effectiveClip.strokeWidth ?? 0}px</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0"
+                      max="10"
+                      value={effectiveClip.strokeWidth ?? 0}
+                      {...rangeTx('Adjust text stroke')}
+                      onChange={(e) =>
+                        updateClip(effectiveClip.id, { strokeWidth: parseInt(e.target.value, 10) })
+                      }
+                      className="w-full h-1 bg-zinc-800 rounded appearance-none cursor-pointer accent-blue-500"
+                    />
+                  </div>
+                  <div>
+                    <div className="flex justify-between text-[10px] text-zinc-400">
+                      <span>Pill Radius</span>
+                      <span className="font-mono">{effectiveClip.bgRadius ?? 8}px</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0"
+                      max="40"
+                      value={effectiveClip.bgRadius ?? 8}
+                      {...rangeTx('Adjust text pill radius')}
+                      onChange={(e) =>
+                        updateClip(effectiveClip.id, { bgRadius: parseInt(e.target.value, 10) })
+                      }
+                      className="w-full h-1 bg-zinc-800 rounded appearance-none cursor-pointer accent-blue-500"
+                    />
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Audio Volume & Fades */}
+            {isTimeScaled && (
+              <div className="space-y-2 rounded-md border border-zinc-800 bg-zinc-900/60 p-2.5">
+                <div className="flex items-center gap-1.5 text-[11px] font-semibold text-emerald-400 uppercase">
+                  <Volume2 className="w-3.5 h-3.5" />
+                  <span>Audio Gain &amp; Fades</span>
+                </div>
+                <div>
+                  <div className="flex justify-between text-[11px] text-zinc-400 mb-1">
+                    <span>Channel Gain</span>
+                    <span className="font-mono text-zinc-200">{Math.round(effectiveClip.volume)}%</span>
+                  </div>
+                  <input
+                    type="range"
+                    min="0"
+                    max="200"
+                    value={effectiveClip.volume}
+                    {...rangeTx('Adjust gain')}
+                    onChange={(e) =>
+                      updateClip(effectiveClip.id, { volume: parseInt(e.target.value, 10) }, { coalesceKey: 'gain' })
+                    }
+                    className="w-full h-1 bg-zinc-800 rounded appearance-none cursor-pointer accent-emerald-500"
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <div className="flex justify-between text-[10px] text-zinc-400">
+                      <span>Fade In</span>
+                      <span className="font-mono">{(effectiveClip.fadeIn ?? 0).toFixed(1)}s</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0"
+                      max="4"
+                      step="0.1"
+                      value={effectiveClip.fadeIn ?? 0}
+                      {...rangeTx('Adjust audio fade in')}
+                      onChange={(e) =>
+                        updateClip(effectiveClip.id, { fadeIn: parseFloat(e.target.value) })
+                      }
+                      className="w-full h-1 bg-zinc-800 rounded appearance-none cursor-pointer accent-emerald-500"
+                    />
+                  </div>
+                  <div>
+                    <div className="flex justify-between text-[10px] text-zinc-400">
+                      <span>Fade Out</span>
+                      <span className="font-mono">{(effectiveClip.fadeOut ?? 0).toFixed(1)}s</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0"
+                      max="4"
+                      step="0.1"
+                      value={effectiveClip.fadeOut ?? 0}
+                      {...rangeTx('Adjust audio fade out')}
+                      onChange={(e) =>
+                        updateClip(effectiveClip.id, { fadeOut: parseFloat(e.target.value) })
+                      }
+                      className="w-full h-1 bg-zinc-800 rounded appearance-none cursor-pointer accent-emerald-500"
+                    />
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         )}
-
-        {/* Audio Track Section */}
-        <div className="space-y-2">
-          <div className="flex items-center gap-1.5 text-[11px] font-semibold text-zinc-400 uppercase tracking-wider">
-            <Volume2 className="w-3.5 h-3.5 text-emerald-400" />
-            <span>Audio Gain & Mixing</span>
-          </div>
-
-          <div className="bg-zinc-900/60 p-2.5 rounded-md border border-zinc-800 space-y-2">
-            <div className="flex justify-between text-[11px] text-zinc-400">
-              <span>Channel Gain</span>
-              <span className="font-mono text-zinc-200">{Math.round(selectedClip.volume)}%</span>
-            </div>
-            <input
-              type="range"
-              min="0"
-              max="200"
-              step="1"
-              value={selectedClip.volume}
-              {...rangeTx('Adjust channel gain')}
-              onChange={(e) => updateClip(selectedClip.id, { volume: parseInt(e.target.value) }, { coalesceKey: `gain:${selectedClip.id}` })}
-              className="w-full h-1 bg-zinc-800 rounded appearance-none cursor-pointer accent-emerald-500"
-            />
-          </div>
-        </div>
       </div>
     </aside>
   );

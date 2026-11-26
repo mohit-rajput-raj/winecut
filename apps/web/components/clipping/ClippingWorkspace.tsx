@@ -1,5 +1,6 @@
 'use client';
 
+/* eslint-disable @next/next/no-img-element */
 import React, { useRef, useState, useEffect, useMemo } from 'react';
 import { useEditor } from '../../lib/editor/EditorContext';
 import { useWorkspace } from '../../lib/workspace/WorkspaceContext';
@@ -7,7 +8,20 @@ import { secondsToTimecode } from '../../lib/editor/time-utils';
 import { MediaAsset } from '../../lib/editor/types';
 import { InteractiveFramerBox, SplitResultPreview } from './FramerCanvasComponents';
 import { InspectorPanel } from '../editor/InspectorPanel';
+import { EditorSidebar } from '../editor/EditorSidebar';
+import { Timeline } from '../editor/Timeline';
 import { ExportModal } from '../editor/ExportModal';
+import { buildCssFilter } from '../../lib/editor/render-utils';
+import {
+  FILTER_PRESETS,
+  STICKER_PACKS,
+  TEXT_STYLE_TEMPLATES,
+} from '../../lib/editor/presets/bundles';
+import {
+  ResizableHandle,
+  ResizablePanel,
+  ResizablePanelGroup,
+} from '../ui/resizable';
 import { Button } from '../ui/button';
 import { Badge } from '../ui/badge';
 import {
@@ -44,6 +58,12 @@ export function ClippingWorkspace() {
     importMediaAsset,
     addClipToTrack,
     updateClip,
+    selectedClipId,
+    selectClip,
+    addRichTextClip,
+    addStickerClip,
+    applyClipFilterPreset,
+    toggleClipLayerEffect,
     sendClipperToEditor,
     saveNow,
     undo,
@@ -55,6 +75,7 @@ export function ClippingWorkspace() {
   } = useEditor();
 
   const [isExportOpen, setIsExportOpen] = useState(false);
+  const [leftPanelTab, setLeftPanelTab] = useState<'framer' | 'assets'>('framer');
   const [volume, setVolume] = useState(85);
   const [isMuted, setIsMuted] = useState(false);
   const [savedToast, setSavedToast] = useState(false);
@@ -175,6 +196,48 @@ export function ClippingWorkspace() {
 
   const totalSourceDur = primaryVideoAsset?.duration || 30;
   const clipDuration = primaryVideoClip?.duration || totalSourceDur;
+
+  const activeOverlayClips = useMemo(() => {
+    return project.timeline.tracks
+      .filter((t) => t.visible && (t.type === 'text' || t.type === 'video'))
+      .flatMap((t) => t.clips)
+      .filter(
+        (c) =>
+          c.id !== primaryVideoClip?.id &&
+          (c.type === 'text' || c.type === 'sticker' || c.type === 'image') &&
+          currentTime >= c.timelineStart &&
+          currentTime <= c.timelineStart + c.duration,
+      );
+  }, [project.timeline.tracks, primaryVideoClip?.id, currentTime]);
+
+  const handleStageDrop = (e: React.DragEvent<HTMLDivElement>) => {
+    const raw = e.dataTransfer.getData('application/x-winecut-drag');
+    if (!raw) return;
+    e.preventDefault();
+    try {
+      const payload = JSON.parse(raw) as {
+        kind?: string;
+        templateId?: string;
+        stickerId?: string;
+        lutId?: string;
+        effectId?: string;
+      };
+      if (payload.kind === 'text-template' && payload.templateId) {
+        const tpl = TEXT_STYLE_TEMPLATES.find((t) => t.id === payload.templateId);
+        if (tpl) addRichTextClip(tpl);
+      } else if (payload.kind === 'sticker' && payload.stickerId) {
+        const st = STICKER_PACKS.find((s) => s.id === payload.stickerId);
+        if (st) addStickerClip(st);
+      } else if (payload.kind === 'filter-preset' && payload.lutId && primaryVideoClip) {
+        const preset = FILTER_PRESETS.find((f) => f.id === payload.lutId);
+        if (preset) applyClipFilterPreset(primaryVideoClip.id, preset.id);
+      } else if (payload.kind === 'layer-effect' && payload.effectId && primaryVideoClip) {
+        toggleClipLayerEffect(primaryVideoClip.id, payload.effectId);
+      }
+    } catch {
+      // ignore invalid drop
+    }
+  };
 
   return (
     <div className="flex flex-col h-screen w-screen bg-[#0a0b0e] text-zinc-100 font-sans overflow-hidden select-none">
@@ -310,10 +373,44 @@ export function ClippingWorkspace() {
         </div>
       </header>
 
-      {/* Main Workspace Grid */}
+      {/* Main Workspace Grid (Top Studio Split + Bottom Full Pro Timeline) */}
       <div className="flex-1 flex min-h-0 overflow-hidden">
-        {/* Left Source Media & Cut Trim Panel */}
-        <aside className="w-72 shrink-0 bg-zinc-950 border-r border-zinc-800 flex flex-col p-3.5 gap-4 overflow-y-auto custom-scrollbar">
+        <ResizablePanelGroup direction="vertical" className="h-full w-full">
+          <ResizablePanel defaultSize={66} minSize={35} className="min-h-0 flex flex-col">
+            <div className="flex-1 flex min-h-0 overflow-hidden">
+              {/* Left Tool Rail: Switch smoothly between Clip Framer Presets & Full Stickers/Text/FX Sidebar */}
+              <aside className="w-72 shrink-0 bg-zinc-950 border-r border-zinc-800 flex flex-col overflow-hidden">
+                <div className="grid grid-cols-2 gap-1 border-b border-zinc-800 bg-zinc-900/60 p-1 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => setLeftPanelTab('framer')}
+                    className={`py-1.5 rounded text-[11px] font-medium cursor-pointer transition-colors ${
+                      leftPanelTab === 'framer'
+                        ? 'bg-emerald-600/30 text-emerald-300 border border-emerald-500/50'
+                        : 'text-zinc-400 hover:text-zinc-200'
+                    }`}
+                  >
+                    Cut &amp; Framer
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setLeftPanelTab('assets')}
+                    className={`py-1.5 rounded text-[11px] font-medium cursor-pointer transition-colors ${
+                      leftPanelTab === 'assets'
+                        ? 'bg-zinc-800 text-white border border-zinc-700'
+                        : 'text-zinc-400 hover:text-zinc-200'
+                    }`}
+                  >
+                    Stickers, Text &amp; FX
+                  </button>
+                </div>
+
+                {leftPanelTab === 'assets' ? (
+                  <div className="flex-1 min-h-0 overflow-hidden">
+                    <EditorSidebar />
+                  </div>
+                ) : (
+                  <div className="flex-1 flex flex-col p-3.5 gap-4 overflow-y-auto custom-scrollbar">
           <div className="space-y-2">
             <div className="flex items-center justify-between text-[11px] font-semibold text-zinc-400 uppercase tracking-wider">
               <span>Source Media</span>
@@ -472,10 +569,21 @@ export function ClippingWorkspace() {
               </button>
             </div>
           </div>
+                  </div>
+                )}
         </aside>
 
         {/* Center Wireframe Clip Cutter Stage */}
-        <div className="flex-1 flex flex-col justify-between bg-[#08080a] min-w-0 overflow-hidden">
+        <div
+          className="flex-1 flex flex-col justify-between bg-[#08080a] min-w-0 overflow-hidden"
+          onDragOver={(e) => {
+            if (e.dataTransfer.types.includes('application/x-winecut-drag')) {
+              e.preventDefault();
+              e.dataTransfer.dropEffect = 'copy';
+            }
+          }}
+          onDrop={handleStageDrop}
+        >
           <div
             ref={stageRef}
             className="flex-1 flex items-center justify-center p-4 overflow-hidden relative"
@@ -484,12 +592,17 @@ export function ClippingWorkspace() {
               primaryVideoAsset ? (
                 <SplitResultPreview
                   videoAsset={primaryVideoAsset}
+                  primaryClip={primaryVideoClip}
+                  overlayClips={activeOverlayClips}
+                  mediaLibrary={project.mediaLibrary}
                   currentTime={currentTime}
                   isPlaying={isPlaying}
                   playbackRate={playbackRate}
                   framerSettings={framerSettings}
                   isMuted={isMuted}
                   volume={volume}
+                  selectedClipId={selectedClipId}
+                  onSelectClip={selectClip}
                 />
               ) : (
                 <div className="text-zinc-500 text-xs font-mono">
@@ -511,6 +624,11 @@ export function ClippingWorkspace() {
                     src={primaryVideoAsset.url}
                     playsInline
                     preload="auto"
+                    style={
+                      primaryVideoClip
+                        ? { filter: buildCssFilter(primaryVideoClip.effects, primaryVideoClip.lutId) }
+                        : undefined
+                    }
                     className="w-full h-full object-contain pointer-events-none"
                   />
                 ) : (
@@ -523,7 +641,7 @@ export function ClippingWorkspace() {
                   </button>
                 )}
 
-                {/* Clip Cutter Wireframe Boxes (Exclusive to Clipping Workflow!) */}
+                {/* Clip Cutter Wireframe Boxes */}
                 <InteractiveFramerBox
                   box={framerSettings.topBox}
                   onChange={(updates) => updateFramerBox('top', updates, { skipHistory: true })}
@@ -543,7 +661,7 @@ export function ClippingWorkspace() {
           </div>
 
           {/* Bottom Scrubber & Playback Bar */}
-          <div className="h-14 border-t border-zinc-800 bg-[#0f1013] px-4 flex items-center justify-between gap-4">
+          <div className="h-12 border-t border-zinc-800 bg-[#0f1013] px-4 flex items-center justify-between gap-4 shrink-0">
             <div className="flex items-center gap-1.5">
               <Button
                 variant="ghost"
@@ -602,10 +720,20 @@ export function ClippingWorkspace() {
           </div>
         </div>
 
-        {/* Right Clipping Inspector */}
-        <div className="w-72 shrink-0 border-l border-zinc-800 overflow-hidden">
+        {/* Right Full Pro Clipping Inspector (Framer + Color + Mask + Animate + Speed) */}
+        <div className="w-76 shrink-0 border-l border-zinc-800 overflow-hidden">
           <InspectorPanel />
         </div>
+            </div>
+          </ResizablePanel>
+
+          <ResizableHandle withHandle />
+
+          {/* Bottom Full Multi-Track Timeline inside Clip Cutter */}
+          <ResizablePanel defaultSize={34} minSize={20} className="min-h-0">
+            <Timeline />
+          </ResizablePanel>
+        </ResizablePanelGroup>
       </div>
 
       {/* Export Modal (Renders 9:16 Top/Bottom Split Crop when exporting from Clipping!) */}

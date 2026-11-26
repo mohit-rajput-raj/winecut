@@ -1,4 +1,5 @@
 'use client';
+/* eslint-disable @next/next/no-img-element */
 
 import React, { useRef, useState, useEffect, useMemo } from 'react';
 import { useEditor } from '../../lib/editor/EditorContext';
@@ -11,7 +12,29 @@ import {
   getRulerIntervals,
   formatRulerTime,
 } from '../../lib/editor/time-utils';
-import { solveTimelineSnap } from '../../lib/editor/canvas-layout';
+import { solveTimelineSnap, MAIN_VIDEO_TRACK_ID } from '../../lib/editor/canvas-layout';
+import { TimelineClip } from '../../lib/editor/types';
+import { mapTimelineToSourceOffset } from '../../lib/editor/engine/velocity';
+import { findAdjacentClipSeams } from '../../lib/editor/engine/transitions';
+import {
+  getCachedWaveform,
+  requestAssetWaveform,
+  sampleWaveformRange,
+  subscribeWaveform,
+} from '../../lib/editor/media-index/waveform-decoder';
+import {
+  getCachedVideoFrame,
+  getFrameBucketMs,
+  getNearestCachedFrame,
+  queueVideoFrames,
+  subscribeFilmstrip,
+} from '../../lib/editor/media-index/frame-extractor';
+import {
+  FILTER_PRESETS,
+  STICKER_PACKS,
+  TEXT_STYLE_TEMPLATES,
+} from '../../lib/editor/presets/bundles';
+import { TransitionSeamButton } from './timeline/TransitionSeamButton';
 import { Button } from '../ui/button';
 import {
   Toolbar,
@@ -50,6 +73,8 @@ import {
   AlignHorizontalSpaceAround
 } from 'lucide-react';
 
+const TIMELINE_HEADER_WIDTH = 196;
+
 /**
  * Adaptive timeline grid canvas rendering adaptive second/millisecond
  * subdivisions across the active scroll viewport at native DPR.
@@ -58,11 +83,13 @@ function TimelineGridCanvas({
   zoomLevel,
   scrollLeft,
   viewportWidth,
+  centerOffsetPx,
   trackCount,
 }: {
   zoomLevel: number;
   scrollLeft: number;
   viewportWidth: number;
+  centerOffsetPx: number;
   trackCount: number;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -86,16 +113,16 @@ function TimelineGridCanvas({
     ctx.clearRect(0, 0, drawWidth, drawHeight);
 
     const { majorStep, minorStep } = getRulerIntervals(zoomLevel);
-    const startSec = Math.max(0, pixelsToTime(scrollLeft, zoomLevel));
-    const endSec = pixelsToTime(scrollLeft + drawWidth, zoomLevel) + majorStep;
+    const startSec = Math.max(0, pixelsToTime(scrollLeft - centerOffsetPx, zoomLevel));
+    const endSec = Math.max(0, pixelsToTime(scrollLeft + drawWidth - centerOffsetPx, zoomLevel) + majorStep);
 
-    const firstMinorIdx = Math.floor(startSec / minorStep);
+    const firstMinorIdx = Math.max(0, Math.floor(startSec / minorStep));
     const lastMinorIdx = Math.ceil(endSec / minorStep);
     const majorRatio = Math.max(1, Math.round(majorStep / minorStep));
 
     for (let idx = firstMinorIdx; idx <= lastMinorIdx; idx++) {
       const sec = Number((idx * minorStep).toFixed(4));
-      const x = timeToPixels(sec, zoomLevel) - scrollLeft;
+      const x = centerOffsetPx + timeToPixels(sec, zoomLevel) - scrollLeft;
       if (x < -1 || x > drawWidth + 1) continue;
 
       const isMajor = idx % majorRatio === 0;
@@ -106,7 +133,7 @@ function TimelineGridCanvas({
       ctx.lineWidth = 1;
       ctx.stroke();
     }
-  }, [zoomLevel, scrollLeft, viewportWidth, trackCount]);
+  }, [zoomLevel, scrollLeft, viewportWidth, centerOffsetPx, trackCount]);
 
   return (
     <canvas
@@ -120,186 +147,258 @@ function TimelineGridCanvas({
   );
 }
 
-// Canvas Audio Waveform Component
-function AudioWaveformCanvas({ 
-  width, 
-  height, 
-  volume, 
-  seed,
-  color = '#94a3b8'
-}: { 
-  width: number; 
-  height: number; 
-  volume: number; 
-  seed: string; 
+// Synchronized Real PCM Audio Waveform Canvas (viewport-sliced for arbitrarily long media)
+function AudioWaveformCanvas({
+  clip,
+  assetUrl,
+  width,
+  offsetPx = 0,
+  visibleWidth,
+  height,
+  zoomLevel,
+  volume,
+  seed = 'audio',
+  color = '#94a3b8',
+}: {
+  clip?: TimelineClip;
+  assetUrl?: string;
+  width: number;
+  offsetPx?: number;
+  visibleWidth?: number;
+  height: number;
+  zoomLevel: number;
+  volume: number;
+  seed?: string;
   color?: string;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [waveRev, setWaveRev] = useState(0);
+  const assetId = clip?.assetId;
+  const drawOffsetPx = Math.max(0, Math.floor(offsetPx));
+  const drawWidth = Math.max(0, Math.min(width - drawOffsetPx, Math.ceil(visibleWidth ?? width)));
+
+  useEffect(() => {
+    if (!assetId || !assetUrl) return;
+    const unsub = subscribeWaveform(assetId, () => setWaveRev((r) => r + 1));
+    if (!getCachedWaveform(assetId)) {
+      void requestAssetWaveform(assetId, assetUrl);
+    }
+    return unsub;
+  }, [assetId, assetUrl]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
-    if (!canvas || width <= 0 || height <= 0) return;
+    if (!canvas || drawWidth <= 0 || height <= 0) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width = Math.floor(width * dpr);
-    canvas.height = Math.floor(height * dpr);
-    ctx.scale(dpr, dpr);
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const pxW = Math.min(4096, Math.floor(drawWidth * dpr));
+    const pxH = Math.floor(height * dpr);
+    if (canvas.width !== pxW || canvas.height !== pxH) {
+      canvas.width = pxW;
+      canvas.height = pxH;
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, drawWidth, height);
 
-    ctx.clearRect(0, 0, width, height);
+    const centerY = height / 2;
+    const barWidth = 2.5;
+    const barGap = 1.5;
+    const stepPx = barWidth + barGap;
+    const totalBars = Math.max(1, Math.floor(width / stepPx));
+    const firstBar = Math.max(0, Math.floor(drawOffsetPx / stepPx));
+    const lastBar = Math.min(totalBars - 1, Math.ceil((drawOffsetPx + drawWidth) / stepPx));
+    const volScale = clip?.muted ? 0.1 : Math.min(1.9, (volume || 100) / 100);
+    const peakData = assetId ? getCachedWaveform(assetId) : undefined;
 
-    // Pseudorandom deterministic waveform based on seed
     let hash = 0;
     for (let i = 0; i < seed.length; i++) {
       hash = (hash << 5) - hash + seed.charCodeAt(i);
       hash |= 0;
     }
 
-    const pseudoRandom = (idx: number) => {
-      const x = Math.sin(hash + idx * 789.123) * 10000;
-      return x - Math.floor(x);
-    };
-
-    const centerY = height / 2;
-    const barWidth = 2.5;
-    const barGap = 1.5;
-    const totalBars = Math.floor(width / (barWidth + barGap));
-    const volScale = Math.min(1.8, (volume || 100) / 100);
-
     ctx.fillStyle = color;
 
-    for (let i = 0; i < totalBars; i++) {
-      const x = i * (barWidth + barGap);
-      const rawAmp = pseudoRandom(i);
-      // Smoothed envelope calculation
-      const envelope = Math.sin((i / totalBars) * Math.PI * 6) * 0.3 + 0.7;
-      const amp = Math.max(2, rawAmp * (height * 0.44) * volScale * envelope);
+    for (let i = firstBar; i <= lastBar; i++) {
+      const x = i * stepPx;
+      const canvasX = x - drawOffsetPx;
+      let rawAmp = 0.15;
+      let fadeMul = 1;
 
+      if (clip) {
+        const localT0 = pixelsToTime(x, zoomLevel);
+        const localT1 = Math.max(localT0 + 0.01, pixelsToTime(x + barWidth, zoomLevel));
+        if (clip.fadeIn > 0 && localT0 < clip.fadeIn) {
+          fadeMul *= Math.max(0.05, localT0 / clip.fadeIn);
+        }
+        if (clip.fadeOut > 0 && localT0 > clip.duration - clip.fadeOut) {
+          fadeMul *= Math.max(0.05, (clip.duration - localT0) / clip.fadeOut);
+        }
+
+        if (peakData) {
+          const src0 = (clip.sourceStart || 0) + mapTimelineToSourceOffset(clip, localT0);
+          const src1 = (clip.sourceStart || 0) + mapTimelineToSourceOffset(clip, localT1);
+          rawAmp = sampleWaveformRange(peakData, src0, src1);
+        } else {
+          const pseudo = Math.sin(hash + i * 789.123) * 10000;
+          rawAmp = 0.25 + (pseudo - Math.floor(pseudo)) * 0.25;
+        }
+      } else {
+        const pseudo = Math.sin(hash + i * 789.123) * 10000;
+        rawAmp = pseudo - Math.floor(pseudo);
+      }
+
+      const amp = Math.max(1.5, rawAmp * (height * 0.44) * volScale * fadeMul);
       ctx.beginPath();
-      ctx.roundRect(x, centerY - amp, barWidth, Math.max(4, amp * 2), 1);
+      ctx.roundRect(canvasX, centerY - amp, barWidth, Math.max(3, amp * 2), 1);
       ctx.fill();
     }
 
-    // Subtle horizontal baseline
     ctx.strokeStyle = 'rgba(255, 255, 255, 0.15)';
     ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.moveTo(0, centerY);
-    ctx.lineTo(width, centerY);
+    ctx.lineTo(drawWidth, centerY);
     ctx.stroke();
+  }, [width, drawOffsetPx, drawWidth, height, volume, seed, color, clip, assetId, zoomLevel, waveRev]);
 
-  }, [width, height, volume, seed, color]);
+  if (drawWidth <= 0) return null;
 
   return (
-    <canvas 
-      ref={canvasRef} 
-      style={{ width: `${width}px`, height: `${height}px` }} 
-      className="absolute inset-0 pointer-events-none opacity-90" 
+    <canvas
+      ref={canvasRef}
+      style={{ left: `${drawOffsetPx}px`, width: `${drawWidth}px`, height: `${height}px` }}
+      className="absolute top-0 bottom-0 pointer-events-none opacity-90"
     />
   );
 }
 
-// Canvas Video Filmstrip Preview Component (Repeating frames matching reference image)
-function VideoFilmstripCanvas({ 
-  width, 
+// Timestamp-Accurate Video Filmstrip Preview Canvas (viewport-sliced so >34s/hour videos stay silky)
+function VideoFilmstripCanvas({
+  clip,
+  assetUrl,
+  width,
+  offsetPx = 0,
+  visibleWidth,
   height,
+  zoomLevel,
   thumbnailUrl,
-  seed = 'scene'
-}: { 
-  width: number; 
-  height: number; 
+  seed = 'scene',
+}: {
+  clip?: TimelineClip;
+  assetUrl?: string;
+  width: number;
+  offsetPx?: number;
+  visibleWidth?: number;
+  height: number;
+  zoomLevel: number;
   thumbnailUrl?: string;
   seed?: string;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [frameRev, setFrameRev] = useState(0);
+  const assetId = clip?.assetId;
+  const drawOffsetPx = Math.max(0, Math.floor(offsetPx));
+  const drawWidth = Math.max(0, Math.min(width - drawOffsetPx, Math.ceil(visibleWidth ?? width)));
+
+  useEffect(() => {
+    if (!assetId || !assetUrl) return;
+    return subscribeFilmstrip(assetId, () => setFrameRev((r) => r + 1));
+  }, [assetId, assetUrl]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
-    if (!canvas || width <= 0 || height <= 0) return;
+    if (!canvas || drawWidth <= 0 || height <= 0) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width = Math.floor(width * dpr);
-    canvas.height = Math.floor(height * dpr);
-    ctx.scale(dpr, dpr);
-
-    ctx.clearRect(0, 0, width, height);
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const pxW = Math.min(4096, Math.floor(drawWidth * dpr));
+    const pxH = Math.floor(height * dpr);
+    if (canvas.width !== pxW || canvas.height !== pxH) {
+      canvas.width = pxW;
+      canvas.height = pxH;
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, drawWidth, height);
 
     const frameAspect = 16 / 9;
-    const frameWidth = Math.max(40, Math.round(height * frameAspect));
+    const frameWidth = Math.max(44, Math.round(height * frameAspect));
     const totalFrames = Math.ceil(width / frameWidth);
+    const firstFrame = Math.max(0, Math.floor(drawOffsetPx / frameWidth));
+    const lastFrame = Math.min(totalFrames - 1, Math.floor((drawOffsetPx + drawWidth) / frameWidth));
+    const bucketMs = getFrameBucketMs(zoomLevel);
 
-    if (thumbnailUrl) {
-      // Draw real thumbnail image repeating side-by-side
+    const missingTimes: number[] = [];
+
+    for (let i = firstFrame; i <= lastFrame; i++) {
+      const x = i * frameWidth;
+      const tileW = Math.min(frameWidth, width - x);
+      const canvasX = x - drawOffsetPx;
+      const localMidTime = pixelsToTime(x + tileW * 0.5, zoomLevel);
+      const srcTime = clip
+        ? (clip.sourceStart || 0) + mapTimelineToSourceOffset(clip, localMidTime)
+        : localMidTime;
+
+      const decoded = assetId ? getCachedVideoFrame(assetId, srcTime, bucketMs) : undefined;
+      const frameCanvas =
+        decoded ?? (assetId ? getNearestCachedFrame(assetId, srcTime) : undefined);
+
+      if (!decoded && assetId && assetUrl) {
+        missingTimes.push(srcTime);
+      }
+
+      if (frameCanvas) {
+        ctx.drawImage(frameCanvas, 0, 0, frameCanvas.width, frameCanvas.height, canvasX, 0, tileW, height);
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.45)';
+        ctx.fillRect(canvasX + tileW - 1, 0, 1, height);
+        continue;
+      }
+
+      let hash = 0;
+      for (let h = 0; h < seed.length; h++) {
+        hash = (hash << 5) - hash + seed.charCodeAt(h);
+        hash |= 0;
+      }
+      const grad = ctx.createLinearGradient(canvasX, 0, canvasX, height);
+      const hueShift = Math.abs((hash + i * 17) % 40);
+      grad.addColorStop(0, `hsl(${205 + hueShift}, 32%, 22%)`);
+      grad.addColorStop(1, `hsl(${215 + hueShift}, 28%, 14%)`);
+      ctx.fillStyle = grad;
+      ctx.fillRect(canvasX, 0, tileW, height);
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.45)';
+      ctx.fillRect(canvasX + tileW - 1, 0, 1, height);
+    }
+
+    if (assetId && assetUrl && missingTimes.length > 0) {
+      queueVideoFrames(assetId, assetUrl, missingTimes, bucketMs);
+    } else if (!assetUrl && thumbnailUrl) {
       const img = new Image();
       img.src = thumbnailUrl;
       img.onload = () => {
         if (!canvasRef.current) return;
-        const currentCtx = canvasRef.current.getContext('2d');
-        if (!currentCtx) return;
-
-        currentCtx.save();
-        for (let i = 0; i < totalFrames; i++) {
+        const cctx = canvasRef.current.getContext('2d');
+        if (!cctx) return;
+        for (let i = firstFrame; i <= lastFrame; i++) {
           const x = i * frameWidth;
-          const drawW = Math.min(frameWidth, width - x);
-          currentCtx.drawImage(img, 0, 0, img.naturalWidth, img.naturalHeight, x, 0, drawW, height);
-
-          // Frame separator line
-          currentCtx.fillStyle = 'rgba(0, 0, 0, 0.45)';
-          currentCtx.fillRect(x + drawW - 1, 0, 1, height);
+          const tileW = Math.min(frameWidth, width - x);
+          const canvasX = x - drawOffsetPx;
+          cctx.drawImage(img, 0, 0, img.naturalWidth, img.naturalHeight, canvasX, 0, tileW, height);
+          cctx.fillStyle = 'rgba(0, 0, 0, 0.45)';
+          cctx.fillRect(canvasX + tileW - 1, 0, 1, height);
         }
-        currentCtx.restore();
       };
-      if (img.complete && img.naturalWidth > 0) {
-        for (let i = 0; i < totalFrames; i++) {
-          const x = i * frameWidth;
-          const drawW = Math.min(frameWidth, width - x);
-          ctx.drawImage(img, 0, 0, img.naturalWidth, img.naturalHeight, x, 0, drawW, height);
-          ctx.fillStyle = 'rgba(0, 0, 0, 0.45)';
-          ctx.fillRect(x + drawW - 1, 0, 1, height);
-        }
-      }
-    } else {
-      // Procedural cinematic filmstrip scene (ocean, sunset, camper vibes as in reference photo)
-      let hash = 0;
-      for (let i = 0; i < seed.length; i++) {
-        hash = (hash << 5) - hash + seed.charCodeAt(i);
-        hash |= 0;
-      }
-
-      for (let i = 0; i < totalFrames; i++) {
-        const x = i * frameWidth;
-        const drawW = Math.min(frameWidth, width - x);
-
-        // Gradient representing cinematic footage
-        const grad = ctx.createLinearGradient(x, 0, x, height);
-        const hueShift = Math.abs((hash + i * 17) % 40);
-        grad.addColorStop(0, `hsl(${195 + hueShift}, 45%, 45%)`); // Ocean blue / sky
-        grad.addColorStop(0.55, `hsl(${180 + hueShift}, 50%, 55%)`); // Surf / turquoise
-        grad.addColorStop(1, `hsl(${35 + hueShift}, 60%, 45%)`); // Golden sand / beach
-
-        ctx.fillStyle = grad;
-        ctx.fillRect(x, 0, drawW, height);
-
-        // Subtle frame divider
-        ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
-        ctx.fillRect(x + drawW - 1, 0, 1, height);
-
-        // Frame number stamp in top corner
-        ctx.fillStyle = 'rgba(255, 255, 255, 0.4)';
-        ctx.font = '8px monospace';
-        ctx.fillText(`#${(i + 1).toString().padStart(2, '0')}`, x + 4, 11);
-      }
     }
-  }, [width, height, thumbnailUrl, seed]);
+  }, [width, drawOffsetPx, drawWidth, height, thumbnailUrl, seed, clip, assetId, assetUrl, zoomLevel, frameRev]);
+
+  if (drawWidth <= 0) return null;
 
   return (
-    <canvas 
-      ref={canvasRef} 
-      style={{ width: `${width}px`, height: `${height}px` }} 
-      className="absolute inset-0 pointer-events-none" 
+    <canvas
+      ref={canvasRef}
+      style={{ left: `${drawOffsetPx}px`, width: `${drawWidth}px`, height: `${height}px` }}
+      className="absolute top-0 bottom-0 pointer-events-none"
     />
   );
 }
@@ -309,6 +408,7 @@ export function Timeline() {
     project,
     currentTime,
     seek,
+    pausePlayback,
     zoomLevel,
     setZoom,
     zoomIn,
@@ -336,6 +436,12 @@ export function Timeline() {
     snapping,
     setSnapping,
     addTextClip,
+    addRichTextClip,
+    addStickerClip,
+    applyClipFilterPreset,
+    toggleClipLayerEffect,
+    setClipTransition,
+    removeClipTransition,
     extractAudioFromClip,
     autoAlignClipDrop,
     autoPackTrack,
@@ -349,14 +455,28 @@ export function Timeline() {
 
   const containerRef = useRef<HTMLDivElement>(null);
   const tracksListRef = useRef<HTMLDivElement>(null);
+  const programmaticScrollTargetRef = useRef<number>(0);
+  const panSessionRef = useRef<{
+    startClientX: number;
+    startTime: number;
+    movedPx: number;
+    clickSeekTime?: number;
+  } | null>(null);
   const [isScrubbing, setIsScrubbing] = useState<boolean>(false);
 
-  // Scroll timeline bar into view automatically when selected (e.g. from Video Window click)
+  // Scroll track row vertically into view when selected (never alter horizontal scrollLeft so centered playhead stays true)
   useEffect(() => {
-    if (!selectedClipId || !tracksListRef.current) return;
+    if (!selectedClipId || !tracksListRef.current || !containerRef.current) return;
     const el = tracksListRef.current.querySelector(`[data-timeline-clip-id="${selectedClipId}"]`) as HTMLElement | null;
+    const scroller = containerRef.current;
     if (el) {
-      el.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'nearest' });
+      const cRect = scroller.getBoundingClientRect();
+      const eRect = el.getBoundingClientRect();
+      if (eRect.top < cRect.top + 36) {
+        scroller.scrollTop = Math.max(0, scroller.scrollTop - (cRect.top + 40 - eRect.top));
+      } else if (eRect.bottom > cRect.bottom - 12) {
+        scroller.scrollTop += eRect.bottom - cRect.bottom + 16;
+      }
     }
   }, [selectedClipId]);
   
@@ -401,30 +521,67 @@ export function Timeline() {
   const [autoAlignEnabled, setAutoAlignEnabled] = useState(true);
   const [activeSnapGuide, setActiveSnapGuide] = useState<{ time: number; label: string } | null>(null);
   const [scrollLeft, setScrollLeft] = useState(0);
-  const [viewportWidth, setViewportWidth] = useState(1200);
+  const [viewportWidth, setViewportWidth] = useState(1000);
+  const duration = project.timeline.duration;
+  const centerOffsetPx = Math.floor(viewportWidth / 2);
+
+  const liveNavRef = useRef({
+    zoomLevel,
+    duration,
+    seek,
+    pausePlayback,
+  });
+
+  useEffect(() => {
+    liveNavRef.current = { zoomLevel, duration, seek, pausePlayback };
+  }, [zoomLevel, duration, seek, pausePlayback]);
 
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
 
     const syncViewport = () => {
-      setScrollLeft(el.scrollLeft);
-      setViewportWidth(Math.max(400, el.clientWidth - 180));
+      const nextWidth = Math.max(320, el.clientWidth - TIMELINE_HEADER_WIDTH);
+      setViewportWidth(nextWidth);
+    };
+
+    const handleScroll = () => {
+      const left = el.scrollLeft;
+      setScrollLeft(left);
+      // Any user scroll/scrollbar/wheel disturbance pauses playback and seeks under centered needle
+      if (!panSessionRef.current && Math.abs(left - programmaticScrollTargetRef.current) > 2.5) {
+        const nav = liveNavRef.current;
+        nav.pausePlayback();
+        programmaticScrollTargetRef.current = left;
+        const nextTime = Math.max(0, Math.min(nav.duration, pixelsToTime(left, nav.zoomLevel)));
+        nav.seek(nextTime);
+      }
     };
 
     syncViewport();
-    el.addEventListener('scroll', syncViewport, { passive: true });
+    el.addEventListener('scroll', handleScroll, { passive: true });
     const ro = new ResizeObserver(syncViewport);
     ro.observe(el);
 
     return () => {
-      el.removeEventListener('scroll', syncViewport);
+      el.removeEventListener('scroll', handleScroll);
       ro.disconnect();
     };
   }, []);
 
-  const duration = project.timeline.duration;
-  const totalWidth = Math.max(1400, timeToPixels(duration + 10, zoomLevel));
+  // Keep timeline scrolled so currentTime stays centered directly beneath the fixed white needle
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const target = timeToPixels(currentTime, zoomLevel);
+    programmaticScrollTargetRef.current = target;
+    if (Math.abs(el.scrollLeft - target) > 0.75) {
+      el.scrollLeft = target;
+    }
+  }, [currentTime, zoomLevel, viewportWidth]);
+
+  const timelineContentWidth = Math.max(viewportWidth, timeToPixels(duration + 12, zoomLevel));
+  const totalWidth = TIMELINE_HEADER_WIDTH + centerOffsetPx + timelineContentWidth + centerOffsetPx;
   const rulerIntervals = useMemo(() => getRulerIntervals(zoomLevel), [zoomLevel]);
 
   // Magnetic Snap points (scalar array kept for edge trim operations)
@@ -465,22 +622,36 @@ export function Timeline() {
   }, [project.timeline.tracks, currentTime]);
 
   const handleRulerMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (e.button !== 0 || !containerRef.current) return;
+    const rect = containerRef.current.getBoundingClientRect();
+    const clickViewportX = e.clientX - rect.left;
+    if (clickViewportX < TIMELINE_HEADER_WIDTH) return;
+
+    pausePlayback();
+    const offsetX = clickViewportX + containerRef.current.scrollLeft - TIMELINE_HEADER_WIDTH - centerOffsetPx;
+    let clickTime = pixelsToTime(offsetX, zoomLevel);
+    if (snapping) {
+      clickTime = snapTime(clickTime, snapPoints, 0.15);
+    }
+    panSessionRef.current = {
+      startClientX: e.clientX,
+      startTime: currentTime,
+      movedPx: 0,
+      clickSeekTime: Math.max(0, Math.min(duration, clickTime)),
+    };
     setIsScrubbing(true);
-    handleRulerScrub(e);
   };
 
-  const handleRulerScrub = (e: React.MouseEvent<HTMLDivElement> | MouseEvent) => {
-    if (!containerRef.current) return;
-    const rect = containerRef.current.getBoundingClientRect();
-    const scrollLeft = containerRef.current.scrollLeft;
-    const offsetX = e.clientX - rect.left + scrollLeft - 180;
-    if (offsetX < 0) return;
-
-    let targetTime = pixelsToTime(offsetX, zoomLevel);
-    if (snapping) {
-      targetTime = snapTime(targetTime, snapPoints, 0.15);
-    }
-    seek(Math.max(0, Math.min(duration, targetTime)));
+  const startTimelinePan = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (e.button !== 0 && e.button !== 1) return;
+    if (e.button === 1) e.preventDefault();
+    pausePlayback();
+    panSessionRef.current = {
+      startClientX: e.clientX,
+      startTime: currentTime,
+      movedPx: 0,
+    };
+    setIsScrubbing(true);
   };
 
   // Ctrl + Mouse Wheel Zoom on Timeline
@@ -505,13 +676,20 @@ export function Timeline() {
 
   useEffect(() => {
     const handleMouseMove = (e: MouseEvent) => {
-      if (isScrubbing) {
-        handleRulerScrub(e);
+      if (isScrubbing && panSessionRef.current) {
+        const deltaPx = e.clientX - panSessionRef.current.startClientX;
+        panSessionRef.current.movedPx = Math.max(panSessionRef.current.movedPx, Math.abs(deltaPx));
+        if (panSessionRef.current.movedPx >= 3) {
+          // Dragging timeline left/right slides clips beneath the non-draggable centered white line
+          const deltaSec = pixelsToTime(-deltaPx, zoomLevel);
+          seek(Math.max(0, Math.min(duration, panSessionRef.current.startTime + deltaSec)));
+        }
       } else if (draggedClip) {
         const deltaPixels = e.clientX - draggedClip.startX;
         const deltaTime = pixelsToTime(deltaPixels, zoomLevel);
+        const isMainTrack = draggedClip.trackId === MAIN_VIDEO_TRACK_ID;
         let newStart = Math.max(0, draggedClip.origStart + deltaTime);
-        if (snapping) {
+        if (snapping && !isMainTrack) {
           const activeClip = project.timeline.tracks.flatMap(t => t.clips).find(c => c.id === draggedClip.id);
           const activeDuration = activeClip?.duration ?? 3;
           const otherSnapPoints = structuredSnapPoints.filter(p => p.clipId !== draggedClip.id);
@@ -644,10 +822,12 @@ export function Timeline() {
           const clip = project.timeline.tracks.flatMap(t => t.clips).find(c => c.id === draggedClip.id);
           autoAlignClipDrop(draggedClip.id, draggedClip.hoverTrackId, clip?.timelineStart ?? 0, autoAlignEnabled);
         } else {
-          // Stayed on same track: commit & auto-align drop on mouseUp
+          // Stayed on same track: commit magnetic V1 reorder or free track alignment
           const currentClip = project.timeline.tracks.flatMap(t => t.clips).find(c => c.id === draggedClip.id);
           if (currentClip && Math.abs(currentClip.timelineStart - draggedClip.origStart) > 0.001) {
-            if (autoAlignEnabled) {
+            if (draggedClip.trackId === MAIN_VIDEO_TRACK_ID) {
+              commitMoveClip(draggedClip.id, draggedClip.origStart, currentClip.timelineStart);
+            } else if (autoAlignEnabled) {
               autoAlignClipDrop(draggedClip.id, draggedClip.trackId, currentClip.timelineStart, true);
             } else {
               commitMoveClip(draggedClip.id, draggedClip.origStart, currentClip.timelineStart);
@@ -677,6 +857,14 @@ export function Timeline() {
       if (draggedClip || trimmingClip) {
         endHistoryTransaction();
       }
+      if (
+        panSessionRef.current &&
+        panSessionRef.current.movedPx < 4 &&
+        panSessionRef.current.clickSeekTime !== undefined
+      ) {
+        seek(panSessionRef.current.clickSeekTime);
+      }
+      panSessionRef.current = null;
       setIsScrubbing(false);
       setDraggedClip(null);
       setTrimmingClip(null);
@@ -711,7 +899,9 @@ export function Timeline() {
     addTrack, 
     trimClipTimeline,
     commitTrimClip,
-    endHistoryTransaction
+    endHistoryTransaction,
+    duration,
+    seek
   ]);
 
   const startClipDrag = (
@@ -753,8 +943,6 @@ export function Timeline() {
       });
     }
   };
-
-  const playheadX = 180 + timeToPixels(currentTime, zoomLevel);
 
   return (
     <div className="w-full h-full bg-[#0c0d10] flex flex-col select-none overflow-hidden relative font-sans">
@@ -989,135 +1177,135 @@ export function Timeline() {
         </div>
       </Toolbar>
 
-      {/* Main Timeline Scrollable Body */}
-      <div 
-        ref={containerRef}
-        className="flex-1 overflow-x-auto overflow-y-auto relative custom-scrollbar bg-[#0b0c0e]"
-      >
-        <div style={{ width: `${totalWidth}px` }} className="relative min-h-full">
-          {/* SMPTE & Clean Interval Ruler (Matching Reference Image) */}
-          <div 
-            onMouseDown={handleRulerMouseDown}
-            className="h-8 border-b border-zinc-800/80 bg-[#0c0d10] sticky top-0 z-20 flex cursor-pointer select-none"
-          >
-            {/* Left Header label */}
-            <div className="w-[180px] shrink-0 border-r border-zinc-800/90 bg-[#101115] px-3 flex items-center justify-between text-[10px] font-mono text-zinc-400">
-              <span className="font-semibold tracking-wider">TRACKS</span>
-              <div className="flex items-center gap-1">
-                <button 
-                  onClick={(e) => { 
-                    e.stopPropagation(); 
-                    const vCount = project.timeline.tracks.filter(t => t.type === 'video').length + 1;
-                    addTrack('video', `Overlay (V${vCount})`, 'top'); 
-                  }}
-                  className="px-1.5 py-0.5 rounded bg-blue-900/70 hover:bg-blue-800 text-[9px] text-blue-200 border border-blue-700/60 font-medium"
-                  title="Add Video Overlay Track on Top"
-                >
-                  + Overlay
-                </button>
-                <button 
-                  onClick={(e) => { e.stopPropagation(); addTrack('audio'); }}
-                  className="px-1.5 py-0.5 rounded bg-emerald-900/70 hover:bg-emerald-800 text-[9px] text-emerald-200 border border-emerald-700/60 font-medium"
-                  title="Add Audio Track"
-                >
-                  + Audio
-                </button>
-              </div>
-            </div>
+      {/* Timeline Scrollable Viewport + Fixed Non-Draggable Center Playhead Overlay */}
+      <div className="flex-1 relative min-h-0 flex flex-col">
+        {/* Fixed Center White Playhead Needle (stays locked & non-draggable while timeline pans left/right underneath) */}
+        <div
+          className="absolute top-0 bottom-0 z-40 pointer-events-none select-none"
+          style={{ left: `${TIMELINE_HEADER_WIDTH + centerOffsetPx}px` }}
+        >
+          {/* White Circular Marker directly on the ruler line */}
+          <div className="w-3.5 h-3.5 rounded-full bg-white shadow-[0_2px_10px_rgba(0,0,0,0.85)] border border-zinc-900/30 -translate-x-1/2 top-2 absolute pointer-events-none" />
+          {/* Vertical White Line needle */}
+          <div className="w-[1.5px] -translate-x-1/2 top-5 bottom-0 absolute bg-white shadow-[0_0_8px_rgba(255,255,255,0.8)] pointer-events-none" />
+        </div>
 
-            {/* Adaptive Ruler intervals: transitions automatically into millisecond subdivisions on zoom */}
-            <div className="flex-1 relative overflow-hidden">
-              {(() => {
-                const { majorStep, minorStep, showMs } = rulerIntervals;
-                const visStartSec = Math.max(0, pixelsToTime(scrollLeft, zoomLevel) - majorStep);
-                const maxTimelineSec = pixelsToTime(totalWidth, zoomLevel);
-                const visEndSec = Math.min(maxTimelineSec, pixelsToTime(scrollLeft + viewportWidth, zoomLevel) + majorStep);
-                const firstIdx = Math.max(0, Math.floor(visStartSec / minorStep));
-                const lastIdx = Math.ceil(visEndSec / minorStep);
-                const majorRatio = Math.max(1, Math.round(majorStep / minorStep));
-                const ticks: React.ReactNode[] = [];
-
-                for (let idx = firstIdx; idx <= lastIdx; idx++) {
-                  const sec = Number((idx * minorStep).toFixed(4));
-                  const left = timeToPixels(sec, zoomLevel);
-                  const isMajor = idx % majorRatio === 0;
-                  const isSubSecond = showMs && Math.abs(sec - Math.round(sec)) > 0.001;
-
-                  ticks.push(
-                    <div
-                      key={idx}
-                      className="absolute top-0 bottom-0 flex flex-col justify-end"
-                      style={{ left: `${left}px` }}
-                    >
-                      {isMajor && (
-                        <span
-                          className={`absolute top-0.5 text-[10px] font-mono pl-1 whitespace-nowrap select-none pointer-events-none ${
-                            isSubSecond
-                              ? 'text-cyan-400/90 font-medium'
-                              : 'text-zinc-300 font-semibold'
-                          }`}
-                        >
-                          {formatRulerTime(sec, showMs)}
-                        </span>
-                      )}
-                      <div
-                        className={`w-[1px] ${
-                          isMajor
-                            ? isSubSecond
-                              ? 'h-2.5 bg-cyan-500/60'
-                              : 'h-3 bg-zinc-400'
-                            : 'h-1.5 bg-zinc-700/80'
-                        }`}
-                      />
-                    </div>
-                  );
-                }
-
-                return ticks;
-              })()}
-            </div>
-          </div>
-
-          {/* White Circular Playhead Needle (Matching Reference Image) */}
-          <div
-            className="absolute top-0 bottom-0 z-30 pointer-events-none"
-            style={{ left: `${playheadX}px` }}
-          >
-            {/* White Circular Knob directly on the ruler line */}
-            <div 
-              onMouseDown={(e) => {
-                e.stopPropagation();
-                setIsScrubbing(true);
-              }}
-              className="w-4 h-4 rounded-full bg-white shadow-[0_2px_10px_rgba(0,0,0,0.8)] border border-zinc-900/30 -translate-x-1/2 top-1.5 absolute pointer-events-auto cursor-ew-resize hover:scale-110 active:scale-95 transition-transform" 
-            />
-            {/* Vertical White Line needle */}
-            <div className="w-[1.5px] h-full bg-white shadow-[0_0_8px_rgba(255,255,255,0.7)]" />
-          </div>
-
-          {/* Live Magnetic Snap Alignment Guide Line */}
-          {activeSnapGuide !== null && (
+        {/* Main Timeline Scrollable Body */}
+        <div
+          ref={containerRef}
+          onMouseDown={(e) => {
+            if (e.button === 1) startTimelinePan(e);
+          }}
+          className="flex-1 overflow-x-auto overflow-y-auto relative custom-scrollbar bg-[#0b0c0e]"
+        >
+          <div style={{ width: `${totalWidth}px` }} className="relative min-h-full">
+            {/* SMPTE & Clean Interval Ruler (drag left/right to pan timeline) */}
             <div
-              style={{ left: `${180 + timeToPixels(activeSnapGuide.time, zoomLevel)}px` }}
-              className="pointer-events-none absolute top-0 bottom-0 z-30 w-[1.5px] bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.85)]"
+              onMouseDown={handleRulerMouseDown}
+              className="h-8 border-b border-zinc-800/80 bg-[#0c0d10] sticky top-0 z-30 flex cursor-grab active:cursor-grabbing select-none"
             >
-              <div className="sticky top-1 -translate-x-1/2 ml-[0.75px] w-fit whitespace-nowrap rounded bg-cyan-500 px-1.5 py-0.5 text-[9px] font-mono font-bold text-zinc-950 shadow">
-                {activeSnapGuide.label}
+              {/* Left Header label */}
+              <div className="w-[196px] shrink-0 border-r border-zinc-800/90 bg-[#101115] px-2 flex items-center justify-between text-[10px] font-mono text-zinc-400 sticky left-0 z-40 cursor-default">
+                <span className="font-semibold tracking-wider">TRACKS</span>
+                <div className="flex items-center gap-1 shrink-0">
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      const vCount = project.timeline.tracks.filter(t => t.type === 'video').length + 1;
+                      addTrack('video', `Overlay (V${vCount})`, 'top');
+                    }}
+                    className="px-1.5 py-0.5 rounded bg-blue-900/70 hover:bg-blue-800 text-[9px] text-blue-200 border border-blue-700/60 font-medium whitespace-nowrap cursor-pointer"
+                    title="Add Video Overlay Track on Top"
+                  >
+                    + Overlay
+                  </button>
+                  <button
+                    onClick={(e) => { e.stopPropagation(); addTrack('audio'); }}
+                    className="px-1.5 py-0.5 rounded bg-emerald-900/70 hover:bg-emerald-800 text-[9px] text-emerald-200 border border-emerald-700/60 font-medium whitespace-nowrap cursor-pointer"
+                    title="Add Audio Track"
+                  >
+                    + Audio
+                  </button>
+                </div>
+              </div>
+
+              {/* Adaptive Ruler intervals centered dynamically with centerOffsetPx */}
+              <div className="flex-1 relative overflow-hidden">
+                {(() => {
+                  const { majorStep, minorStep, showMs } = rulerIntervals;
+                  const visStartSec = Math.max(0, pixelsToTime(scrollLeft - centerOffsetPx, zoomLevel) - majorStep);
+                  const maxTimelineSec = pixelsToTime(timelineContentWidth, zoomLevel);
+                  const visEndSec = Math.min(maxTimelineSec, pixelsToTime(scrollLeft + viewportWidth - centerOffsetPx, zoomLevel) + majorStep);
+                  const firstIdx = Math.max(0, Math.floor(visStartSec / minorStep));
+                  const lastIdx = Math.ceil(visEndSec / minorStep);
+                  const majorRatio = Math.max(1, Math.round(majorStep / minorStep));
+                  const ticks: React.ReactNode[] = [];
+
+                  for (let idx = firstIdx; idx <= lastIdx; idx++) {
+                    const sec = Number((idx * minorStep).toFixed(4));
+                    const left = centerOffsetPx + timeToPixels(sec, zoomLevel);
+                    const isMajor = idx % majorRatio === 0;
+                    const isSubSecond = showMs && Math.abs(sec - Math.round(sec)) > 0.001;
+
+                    ticks.push(
+                      <div
+                        key={idx}
+                        className="absolute top-0 bottom-0 flex flex-col justify-end"
+                        style={{ left: `${left}px` }}
+                      >
+                        {isMajor && (
+                          <span
+                            className={`absolute top-0.5 text-[10px] font-mono pl-1 whitespace-nowrap select-none pointer-events-none ${
+                              isSubSecond
+                                ? 'text-cyan-400/90 font-medium'
+                                : 'text-zinc-300 font-semibold'
+                            }`}
+                          >
+                            {formatRulerTime(sec, showMs)}
+                          </span>
+                        )}
+                        <div
+                          className={`w-[1px] ${
+                            isMajor
+                              ? isSubSecond
+                                ? 'h-2.5 bg-cyan-500/60'
+                                : 'h-3 bg-zinc-400'
+                              : 'h-1.5 bg-zinc-700/80'
+                          }`}
+                        />
+                      </div>
+                    );
+                  }
+
+                  return ticks;
+                })()}
               </div>
             </div>
-          )}
 
-          {/* Tracks List Container */}
-          <div ref={tracksListRef} className="flex flex-col relative bg-[#0e0f13]">
-            {/* Adaptive Timeline Subdivisions Backdrop Canvas */}
-            <div className="pointer-events-none absolute top-0 bottom-0 left-[180px] right-0 z-0 overflow-hidden">
-              <TimelineGridCanvas
-                zoomLevel={zoomLevel}
-                scrollLeft={scrollLeft}
-                viewportWidth={viewportWidth}
-                trackCount={project.timeline.tracks.length}
-              />
-            </div>
+            {/* Live Magnetic Snap Alignment Guide Line */}
+            {activeSnapGuide !== null && (
+              <div
+                style={{ left: `${TIMELINE_HEADER_WIDTH + centerOffsetPx + timeToPixels(activeSnapGuide.time, zoomLevel)}px` }}
+                className="pointer-events-none absolute top-0 bottom-0 z-30 w-[1.5px] bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.85)]"
+              >
+                <div className="sticky top-1 -translate-x-1/2 ml-[0.75px] w-fit whitespace-nowrap rounded bg-cyan-500 px-1.5 py-0.5 text-[9px] font-mono font-bold text-zinc-950 shadow">
+                  {activeSnapGuide.label}
+                </div>
+              </div>
+            )}
+
+            {/* Tracks List Container */}
+            <div ref={tracksListRef} className="flex flex-col relative bg-[#0e0f13]">
+              {/* Adaptive Timeline Subdivisions Backdrop Canvas */}
+              <div className="pointer-events-none absolute top-0 bottom-0 left-[196px] right-0 z-0 overflow-hidden">
+                <TimelineGridCanvas
+                  zoomLevel={zoomLevel}
+                  scrollLeft={scrollLeft}
+                  viewportWidth={viewportWidth}
+                  centerOffsetPx={centerOffsetPx}
+                  trackCount={project.timeline.tracks.length}
+                />
+              </div>
 
             {/* Drop Indicator for New Track Above */}
             {draggedClip?.isAboveTop && (
@@ -1129,7 +1317,7 @@ export function Timeline() {
             {project.timeline.tracks.map((track) => {
               const isVideoTrack = track.type === 'video';
               const isAudioTrack = track.type === 'audio';
-              const trackHeight = isVideoTrack ? 'h-[74px]' : 'h-[44px]';
+              const trackHeight = isVideoTrack ? 'h-[68px]' : 'h-[28px]';
               const isHoveredTarget = draggedClip?.hoverTrackId === track.id;
 
               return (
@@ -1141,23 +1329,20 @@ export function Timeline() {
                   }`}
                 >
                   {/* Left Track Control Header */}
-                  <div className="w-[180px] shrink-0 border-r border-zinc-800/80 bg-[#101115] px-2.5 flex items-center justify-between sticky left-0 z-10 select-none">
-                    <div className="flex items-center gap-1.5 min-w-0">
-                      <span className={`text-[10px] font-mono font-bold px-1.5 py-0.5 rounded border ${
+                  <div className="w-[196px] shrink-0 border-r border-zinc-800/80 bg-[#101115] px-2 flex items-center justify-between gap-1.5 sticky left-0 z-30 select-none">
+                    <div className="flex items-center gap-1 min-w-0 flex-1">
+                      <span className={`text-[10px] font-mono font-bold px-1.5 py-0.5 rounded border whitespace-nowrap truncate max-w-[92px] ${
                         isVideoTrack 
                           ? 'bg-blue-950/80 text-blue-300 border-blue-800/60' 
                           : isAudioTrack 
                             ? 'bg-emerald-950/80 text-emerald-300 border-emerald-800/60'
                             : 'bg-amber-950/80 text-amber-300 border-amber-800/60'
-                      }`}>
+                      }`} title={track.name}>
                         {track.name}
-                      </span>
-                      <span className="text-[11px] font-medium text-zinc-400 capitalize truncate max-w-[60px]">
-                        {track.type}
                       </span>
                     </div>
 
-                    <div className="flex items-center gap-1 text-zinc-400">
+                    <div className="flex items-center gap-0.5 text-zinc-400 shrink-0">
                       <button
                         onClick={() => toggleTrackVisibility(track.id)}
                         className={`p-1 hover:text-white rounded ${!track.visible ? 'text-zinc-600' : ''}`}
@@ -1191,11 +1376,79 @@ export function Timeline() {
                     </div>
                   </div>
 
-                  {/* Track Timeline Lane & Clips */}
-                  <div className="flex-1 relative h-full overflow-hidden">
+                  {/* Track Timeline Lane & Clips (drag empty lane left/right to pan timeline) */}
+                  <div
+                    onMouseDown={startTimelinePan}
+                    className="flex-1 relative h-full overflow-hidden z-0 cursor-grab active:cursor-grabbing"
+                    onDragOver={(e) => {
+                      if (e.dataTransfer.types.includes('application/x-winecut-drag')) {
+                        e.preventDefault();
+                        e.dataTransfer.dropEffect = 'copy';
+                      }
+                    }}
+                    onDrop={(e) => {
+                      const raw = e.dataTransfer.getData('application/x-winecut-drag');
+                      if (!raw) return;
+                      e.preventDefault();
+                      try {
+                        const payload = JSON.parse(raw) as {
+                          kind?: string;
+                          assetId?: string;
+                          templateId?: string;
+                          stickerId?: string;
+                          lutId?: string;
+                          effectId?: string;
+                        };
+                        const rect = e.currentTarget.getBoundingClientRect();
+                        const dropTime = Math.max(0, pixelsToTime(e.clientX - rect.left - centerOffsetPx, zoomLevel));
+                        if (payload.kind === 'media' && payload.assetId) {
+                          const found = project.mediaLibrary.find((a) => a.id === payload.assetId);
+                          if (found) addClipToTrack(track.id, found);
+                        } else if (payload.kind === 'text-template' && payload.templateId) {
+                          const tpl = TEXT_STYLE_TEMPLATES.find((t) => t.id === payload.templateId);
+                          if (tpl) addRichTextClip(tpl, { timelineStart: dropTime, trackId: track.id });
+                        } else if (payload.kind === 'sticker' && payload.stickerId) {
+                          const st = STICKER_PACKS.find((s) => s.id === payload.stickerId);
+                          if (st) addStickerClip(st, { timelineStart: dropTime, trackId: track.id });
+                        } else if (payload.kind === 'filter-preset' && payload.lutId) {
+                          const hitClip = track.clips.find(
+                            (c) => dropTime >= c.timelineStart && dropTime <= c.timelineStart + c.duration,
+                          );
+                          const preset = FILTER_PRESETS.find((f) => f.id === payload.lutId);
+                          if (hitClip && preset) applyClipFilterPreset(hitClip.id, preset.id);
+                        } else if (payload.kind === 'layer-effect' && payload.effectId) {
+                          const hitClip = track.clips.find(
+                            (c) => dropTime >= c.timelineStart && dropTime <= c.timelineStart + c.duration,
+                          );
+                          if (hitClip) toggleClipLayerEffect(hitClip.id, payload.effectId);
+                        }
+                      } catch {
+                        // ignore invalid drop payload
+                      }
+                    }}
+                  >
+                    {/* '+' Transition Buttons on Adjacent Clip Seams */}
+                    {findAdjacentClipSeams(track, project.timeline.transitions || []).map((seam) => (
+                      <TransitionSeamButton
+                        key={seam.key}
+                        leftPx={centerOffsetPx + timeToPixels(seam.seamTime, zoomLevel)}
+                        trackId={seam.trackId}
+                        fromClipId={seam.fromClip.id}
+                        toClipId={seam.toClip.id}
+                        existing={seam.existingTransition}
+                        onSelect={setClipTransition}
+                        onRemove={removeClipTransition}
+                      />
+                    ))}
+
                     {track.clips.map((clip) => {
-                      const left = timeToPixels(clip.timelineStart, zoomLevel);
+                      const left = centerOffsetPx + timeToPixels(clip.timelineStart, zoomLevel);
                       const width = Math.max(36, timeToPixels(clip.duration, zoomLevel));
+                      const visLaneMin = Math.max(0, scrollLeft - 500);
+                      const visLaneMax = scrollLeft + viewportWidth + 500;
+                      const quantSliceStart = Math.max(0, Math.floor((visLaneMin - left) / 400) * 400);
+                      const quantSliceEnd = Math.min(width, Math.ceil((visLaneMax - left) / 400) * 400);
+                      const quantSliceWidth = Math.max(0, quantSliceEnd - quantSliceStart);
                       const isSelected = selectedClipId === clip.id;
                       const asset = project.mediaLibrary.find(a => a.id === clip.assetId);
 
@@ -1216,11 +1469,16 @@ export function Timeline() {
                                 : 'border-zinc-700/60 hover:border-zinc-500 bg-zinc-900 shadow-md'
                             }`}
                           >
-                            {/* Top Tier: Repeating Video Filmstrip (~65% height) */}
-                            <div className="relative flex-1 overflow-hidden min-h-[42px] bg-zinc-950">
+                            {/* Top Tier: Time-Accurate Video Filmstrip (~65% height) */}
+                            <div className="relative flex-1 overflow-hidden min-h-[38px] bg-zinc-950">
                               <VideoFilmstripCanvas
+                                clip={clip}
+                                assetUrl={asset?.url}
                                 width={width}
-                                height={44}
+                                offsetPx={quantSliceStart}
+                                visibleWidth={quantSliceWidth}
+                                height={38}
+                                zoomLevel={zoomLevel}
                                 thumbnailUrl={asset?.thumbnailUrl}
                                 seed={clip.name + clip.id}
                               />
@@ -1239,8 +1497,13 @@ export function Timeline() {
                             {/* Bottom Tier: Integrated Synchronized Audio Waveform Lane (~35% height) */}
                             <div className="h-[22px] bg-[#101216]/95 border-t border-black/40 relative overflow-hidden flex items-center">
                               <AudioWaveformCanvas
+                                clip={clip}
+                                assetUrl={asset?.url}
                                 width={width}
+                                offsetPx={quantSliceStart}
+                                visibleWidth={quantSliceWidth}
                                 height={22}
+                                zoomLevel={zoomLevel}
                                 volume={clip.volume}
                                 seed={clip.name + clip.id}
                                 color="#94a3b8"
@@ -1285,36 +1548,41 @@ export function Timeline() {
                               left: `${left}px`,
                               width: `${width}px`,
                             }}
-                            className={`absolute top-1 bottom-1 rounded-md border text-xs flex items-center justify-between cursor-move select-none overflow-hidden transition-shadow group/clip ${bgGradient} ${
+                            className={`absolute top-0.5 bottom-0.5 rounded-md border text-[11px] flex items-center justify-between cursor-move select-none overflow-hidden transition-shadow group/clip ${bgGradient} ${
                               isSelected 
                                 ? 'ring-2 ring-white border-white shadow-[0_0_15px_rgba(255,255,255,0.4)] z-10' 
                                 : 'shadow-md hover:brightness-105'
                             }`}
                           >
                             {/* Fade In Corner Triangle Handle (Reference Image Feature) */}
-                            <div className="absolute top-0 left-0 w-0 h-0 border-t-[8px] border-t-white/80 border-r-[8px] border-r-transparent z-10" />
+                            <div className="absolute top-0 left-0 w-0 h-0 border-t-[6px] border-t-white/80 border-r-[6px] border-r-transparent z-10" />
 
-                            {/* Centered Waveform Canvas */}
+                            {/* Centered Real Audio Waveform Canvas */}
                             <AudioWaveformCanvas 
-                              width={width} 
-                              height={34} 
+                              clip={clip}
+                              assetUrl={asset?.url}
+                              width={width}
+                              offsetPx={quantSliceStart}
+                              visibleWidth={quantSliceWidth}
+                              height={22}
+                              zoomLevel={zoomLevel}
                               volume={clip.volume} 
                               seed={clip.name + clip.id} 
                               color="rgba(255, 255, 255, 0.75)"
                             />
 
                             {/* Fade Out Corner Triangle Handle (Reference Image Feature) */}
-                            <div className="absolute top-0 right-0 w-0 h-0 border-t-[8px] border-t-white/80 border-l-[8px] border-l-transparent z-10" />
+                            <div className="absolute top-0 right-0 w-0 h-0 border-t-[6px] border-t-white/80 border-l-[6px] border-l-transparent z-10" />
 
                             {/* Title & Info */}
-                            <div className="flex items-center gap-1.5 min-w-0 px-2.5 z-10">
-                              <Music className="w-3.5 h-3.5 shrink-0 text-white drop-shadow" />
-                              <span className="truncate font-semibold text-[11px] text-white drop-shadow">
+                            <div className="flex items-center gap-1 min-w-0 px-2 z-10">
+                              <Music className="w-3 h-3 shrink-0 text-white drop-shadow" />
+                              <span className="truncate font-semibold text-[10px] text-white drop-shadow">
                                 {clip.name}
                               </span>
                             </div>
 
-                            <span className="text-[9px] font-mono text-white/90 shrink-0 pr-3 z-10 drop-shadow">
+                            <span className="text-[9px] font-mono text-white/90 shrink-0 pr-2.5 z-10 drop-shadow">
                               {clip.duration.toFixed(1)}s
                             </span>
 
@@ -1379,6 +1647,48 @@ export function Timeline() {
                         );
                       }
 
+                      // Sticker Clip Styling
+                      if (clip.type === 'sticker') {
+                        return (
+                          <div
+                            key={clip.id}
+                            data-timeline-clip-id={clip.id}
+                            onMouseDown={(e) => startClipDrag(e, clip, track)}
+                            style={{
+                              left: `${left}px`,
+                              width: `${width}px`,
+                            }}
+                            className={`absolute top-1 bottom-1 rounded-md border flex items-center justify-between cursor-move select-none overflow-hidden transition-shadow group/clip bg-gradient-to-r from-cyan-900/90 to-teal-900/80 ${
+                              isSelected
+                                ? 'border-white ring-2 ring-white/90 shadow-[0_0_15px_rgba(255,255,255,0.3)] z-10'
+                                : 'border-cyan-500/50 hover:border-cyan-400 shadow-md'
+                            }`}
+                          >
+                            <div className="flex items-center gap-1.5 min-w-0 px-2 z-10 flex-1">
+                              {clip.stickerSvg && (
+                                <img
+                                  src={`data:image/svg+xml;utf8,${encodeURIComponent(clip.stickerSvg)}`}
+                                  alt={clip.name}
+                                  className="h-5 w-5 shrink-0 object-contain pointer-events-none"
+                                />
+                              )}
+                              <span className="truncate font-semibold text-[11px] text-white">{clip.name}</span>
+                            </div>
+                            <span className="text-[9px] font-mono text-white/80 shrink-0 pr-3 z-10">
+                              {clip.duration.toFixed(1)}s
+                            </span>
+                            <div
+                              onMouseDown={(e) => startClipTrim(e, clip, track, 'left')}
+                              className="absolute left-0 top-0 bottom-0 w-2.5 cursor-ew-resize hover:bg-white/40 active:bg-white/60 z-20"
+                            />
+                            <div
+                              onMouseDown={(e) => startClipTrim(e, clip, track, 'right')}
+                              className="absolute right-0 top-0 bottom-0 w-2.5 cursor-ew-resize hover:bg-white/40 active:bg-white/60 z-20"
+                            />
+                          </div>
+                        );
+                      }
+
                       // Text / Subtitle Clip Styling
                       return (
                         <div
@@ -1389,20 +1699,20 @@ export function Timeline() {
                             left: `${left}px`,
                             width: `${width}px`,
                           }}
-                          className={`absolute top-1 bottom-1 rounded-md border text-xs flex items-center justify-between cursor-move select-none overflow-hidden transition-shadow group/clip bg-gradient-to-r from-amber-700 to-amber-800 border-amber-500/50 text-white ${
+                          className={`absolute top-0.5 bottom-0.5 rounded-md border text-[11px] flex items-center justify-between cursor-move select-none overflow-hidden transition-shadow group/clip bg-gradient-to-r from-amber-700 to-amber-800 border-amber-500/50 text-white ${
                             isSelected 
                               ? 'ring-2 ring-white border-white shadow-[0_0_15px_rgba(255,255,255,0.4)] z-10' 
                               : 'shadow-md hover:brightness-105'
                           }`}
                         >
-                          <div className="flex items-center gap-1.5 min-w-0 px-2.5 z-10">
-                            <Type className="w-3.5 h-3.5 shrink-0 text-amber-200" />
-                            <span className="truncate font-semibold text-[11px]">
+                          <div className="flex items-center gap-1 min-w-0 px-2 z-10">
+                            <Type className="w-3 h-3 shrink-0 text-amber-200" />
+                            <span className="truncate font-semibold text-[10px]">
                               {clip.textContent || clip.name}
                             </span>
                           </div>
 
-                          <span className="text-[9px] font-mono text-white/80 shrink-0 pr-3 z-10">
+                          <span className="text-[9px] font-mono text-white/80 shrink-0 pr-2.5 z-10">
                             {clip.duration.toFixed(1)}s
                           </span>
 
@@ -1429,6 +1739,7 @@ export function Timeline() {
                 + Drop to create new Track at bottom
               </div>
             )}
+            </div>
           </div>
         </div>
       </div>

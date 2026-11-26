@@ -13,7 +13,12 @@ import {
   Transform,
   TrackType,
   FramerBox,
-  FramerSettings
+  FramerSettings,
+  AnimationSlot,
+  MaskConfig,
+  SpeedCurveConfig,
+  TransitionEdge,
+  TransitionType
 } from './types';
 import { INITIAL_PROJECT, DEFAULT_FRAMER_SETTINGS } from './sample-data';
 import { SnapshotHistoryManager, EditorSnapshot } from './commands';
@@ -23,7 +28,16 @@ import {
   packTrackMediaSequentially,
   alignTransformToCanvas,
   computeAutoLayoutTransforms,
+  MAIN_VIDEO_TRACK_ID,
+  moveClipMagnetically,
+  enforceMainTrackMagnetism,
+  computeElasticTimelineDuration,
 } from './canvas-layout';
+import { DEFAULT_MASK_CONFIG } from './engine/masks';
+import { getCurveDurationMultiplier, mapTimelineToSourceOffset } from './engine/velocity';
+import type { StickerPresetDef, TextStyleTemplate } from './presets/bundles';
+
+export type SidebarTabId = 'media' | 'text' | 'stickers' | 'audio' | 'effects' | 'skills' | 'export';
 
 interface EditorContextType {
   project: EditorProject;
@@ -36,13 +50,14 @@ interface EditorContextType {
   zoomLevel: number;
   playbackRate: number;
   aspectRatio: AspectRatio;
-  activeSidebarTab: 'media' | 'text' | 'audio' | 'effects' | 'skills' | 'export';
+  activeSidebarTab: SidebarTabId;
   snapping: boolean;
   canUndo: boolean;
   canRedo: boolean;
   
   // Playback & Zoom Actions
   togglePlay: () => void;
+  pausePlayback: () => void;
   seek: (time: number) => void;
   setPlaybackRate: (rate: number) => void;
   setZoom: (zoom: number) => void;
@@ -50,7 +65,7 @@ interface EditorContextType {
   zoomOut: () => void;
   zoomFit: () => void;
   setAspectRatio: (ratio: AspectRatio) => void;
-  setActiveSidebarTab: (tab: 'media' | 'text' | 'audio' | 'effects' | 'skills' | 'export') => void;
+  setActiveSidebarTab: (tab: SidebarTabId) => void;
   setSnapping: (enabled: boolean) => void;
   selectClip: (clipId: string | null) => void;
   
@@ -59,6 +74,13 @@ interface EditorContextType {
   updateClipTransform: (clipId: string, transform: Partial<Transform>, options?: { skipHistory?: boolean; coalesceKey?: string }) => void;
   updateClipEffect: (clipId: string, effectId: string, value: number) => void;
   batchUpdateClipEffects: (clipId: string, effectsMap: Partial<Record<EffectType, number>>) => void;
+  applyClipFilterPreset: (clipId: string, lutId: string) => void;
+  updateClipMask: (clipId: string, updates: Partial<MaskConfig>, options?: { skipHistory?: boolean; coalesceKey?: string }) => void;
+  updateClipAnimation: (clipId: string, dir: 'in' | 'out' | 'middle', slot: AnimationSlot | undefined) => void;
+  updateClipSpeedCurve: (clipId: string, curve: SpeedCurveConfig) => void;
+  toggleClipLayerEffect: (clipId: string, effectId: string) => void;
+  setClipTransition: (trackId: string, fromClipId: string, toClipId: string, type: TransitionType, duration?: number) => void;
+  removeClipTransition: (transitionId: string) => void;
   updateProjectSettings: (updates: Partial<ProjectSettings>) => void;
   moveClip: (clipId: string, newStart: number) => void;
   commitMoveClip: (clipId: string, prevStart: number, newStart: number) => void;
@@ -95,6 +117,8 @@ interface EditorContextType {
   addClipToTrack: (trackId: string, asset: MediaAsset) => void;
   autoAddMediaToTimeline: (asset: MediaAsset) => void;
   addTextClip: (textPreset?: string) => void;
+  addRichTextClip: (template: TextStyleTemplate, options?: { timelineStart?: number; trackId?: string; x?: number; y?: number }) => void;
+  addStickerClip: (sticker: StickerPresetDef, options?: { timelineStart?: number; trackId?: string; x?: number; y?: number }) => void;
   importMediaAsset: (asset: MediaAsset, rawFileBlob?: Blob) => void;
   extractAudioFromClip: (clipId: string) => void;
   
@@ -146,7 +170,7 @@ export function EditorProvider({ children }: { children: React.ReactNode }) {
   const [clipboardClip, setClipboardClip] = useState<TimelineClip | null>(null);
   const [zoomLevel, setZoomLevel] = useState<number>(1.0);
   const [playbackRate, setPlaybackRate] = useState<number>(1.0);
-  const [activeSidebarTab, setActiveSidebarTab] = useState<'media' | 'text' | 'audio' | 'effects' | 'skills' | 'export'>('media');
+  const [activeSidebarTab, setActiveSidebarTab] = useState<SidebarTabId>('media');
   const [snapping, setSnapping] = useState<boolean>(true);
   const [activeMonitorTab, setActiveMonitorTab] = useState<'video' | 'framer'>(
     initialProj.mode === 'clipping' ? 'framer' : 'video'
@@ -383,8 +407,17 @@ export function EditorProvider({ children }: { children: React.ReactNode }) {
     });
   }, []);
 
+  const pausePlayback = useCallback(() => {
+    setIsPlaying(false);
+  }, []);
+
   const seek = useCallback((time: number) => {
-    const clamped = Math.max(0, Math.min(time, projectRef.current.timeline.duration));
+    const allClips = projectRef.current.timeline.tracks.flatMap(t => t.clips);
+    const maxClipEndTime = allClips.length > 0
+      ? Math.max(...allClips.map(c => c.timelineStart + c.duration))
+      : 0;
+    const effectiveDur = Math.max(projectRef.current.timeline.duration, maxClipEndTime);
+    const clamped = Math.max(0, Math.min(time, effectiveDur));
     setCurrentTime(clamped);
   }, []);
 
@@ -585,10 +618,181 @@ export function EditorProvider({ children }: { children: React.ReactNode }) {
     }), { label: 'Adjust master grade / blur', coalesceKey: 'project-settings' });
   }, [commitProjectEdit]);
 
-  // Move Clip smoothly during drag without polluting history on every pixel
+  const applyClipFilterPreset = useCallback((clipId: string, lutId: string) => {
+    commitProjectEdit(prev => ({
+      ...prev,
+      timeline: {
+        ...prev.timeline,
+        tracks: prev.timeline.tracks.map(t => ({
+          ...t,
+          clips: t.clips.map(c => (c.id === clipId ? { ...c, lutId: lutId === 'none' ? undefined : lutId } : c)),
+        })),
+      },
+    }), { label: `Apply filter ${lutId}` });
+  }, [commitProjectEdit]);
+
+  const updateClipMask = useCallback((
+    clipId: string,
+    updates: Partial<MaskConfig>,
+    options?: { skipHistory?: boolean; coalesceKey?: string }
+  ) => {
+    commitProjectEdit(prev => ({
+      ...prev,
+      timeline: {
+        ...prev.timeline,
+        tracks: prev.timeline.tracks.map(t => ({
+          ...t,
+          clips: t.clips.map(c => {
+            if (c.id !== clipId) return c;
+            const currentMask = c.mask || DEFAULT_MASK_CONFIG;
+            return { ...c, mask: { ...currentMask, ...updates } };
+          }),
+        })),
+      },
+    }), {
+      label: 'Adjust mask',
+      coalesceKey: options?.skipHistory ? undefined : (options?.coalesceKey ?? `mask:${clipId}`),
+      ...options,
+    });
+  }, [commitProjectEdit]);
+
+  const updateClipAnimation = useCallback((
+    clipId: string,
+    dir: 'in' | 'out' | 'middle',
+    slot: AnimationSlot | undefined
+  ) => {
+    commitProjectEdit(prev => ({
+      ...prev,
+      timeline: {
+        ...prev.timeline,
+        tracks: prev.timeline.tracks.map(t => ({
+          ...t,
+          clips: t.clips.map(c => {
+            if (c.id !== clipId) return c;
+            return {
+              ...c,
+              animations: {
+                ...(c.animations || {}),
+                [dir]: slot && slot.presetId !== 'none' ? slot : undefined,
+              },
+            };
+          }),
+        })),
+      },
+    }), { label: `Set ${dir} animation`, coalesceKey: `anim:${clipId}:${dir}` });
+  }, [commitProjectEdit]);
+
+  const updateClipSpeedCurve = useCallback((clipId: string, curve: SpeedCurveConfig) => {
+    const mult = getCurveDurationMultiplier(curve);
+    commitProjectEdit(prev => ({
+      ...prev,
+      timeline: {
+        ...prev.timeline,
+        tracks: prev.timeline.tracks.map(t => ({
+          ...t,
+          clips: t.clips.map(c => {
+            if (c.id !== clipId) return c;
+            const sourceSpan = Math.max(0.2, (c.sourceEnd ?? c.duration) - (c.sourceStart ?? 0));
+            const nextDuration = Math.max(0.2, Number((sourceSpan * mult).toFixed(3)));
+            return {
+              ...c,
+              speedCurve: curve,
+              duration: nextDuration,
+            };
+          }),
+        })),
+      },
+    }), { label: 'Adjust velocity curve', coalesceKey: `speed:${clipId}` });
+  }, [commitProjectEdit]);
+
+  const toggleClipLayerEffect = useCallback((clipId: string, effectId: string) => {
+    commitProjectEdit(prev => ({
+      ...prev,
+      timeline: {
+        ...prev.timeline,
+        tracks: prev.timeline.tracks.map(t => ({
+          ...t,
+          clips: t.clips.map(c => {
+            if (c.id !== clipId) return c;
+            const current = c.layerEffects || [];
+            const exists = current.includes(effectId);
+            return {
+              ...c,
+              layerEffects: exists ? current.filter(e => e !== effectId) : [...current, effectId],
+            };
+          }),
+        })),
+      },
+    }), { label: `Toggle effect ${effectId}` });
+  }, [commitProjectEdit]);
+
+  const setClipTransition = useCallback((
+    trackId: string,
+    fromClipId: string,
+    toClipId: string,
+    type: TransitionType,
+    duration: number = 0.5
+  ) => {
+    commitProjectEdit(prev => {
+      const existing = prev.timeline.transitions || [];
+      const filtered = existing.filter(
+        tr => !(tr.trackId === trackId && tr.fromClipId === fromClipId && tr.toClipId === toClipId)
+      );
+      const nextEdge: TransitionEdge = {
+        id: `tr-${fromClipId}-${toClipId}`,
+        trackId,
+        fromClipId,
+        toClipId,
+        type,
+        duration,
+      };
+      return {
+        ...prev,
+        timeline: {
+          ...prev.timeline,
+          transitions: [...filtered, nextEdge],
+        },
+      };
+    }, { label: `Set ${type} transition`, coalesceKey: `tr:${fromClipId}:${toClipId}` });
+  }, [commitProjectEdit]);
+
+  const removeClipTransition = useCallback((transitionId: string) => {
+    commitProjectEdit(prev => ({
+      ...prev,
+      timeline: {
+        ...prev.timeline,
+        transitions: (prev.timeline.transitions || []).filter(tr => tr.id !== transitionId),
+      },
+    }), { label: 'Remove transition' });
+  }, [commitProjectEdit]);
+
+  // Move Clip smoothly during drag (Main Video track V1 enforces magnetic gap-free reordering)
   const moveClip = useCallback((clipId: string, newStart: number) => {
-    updateClip(clipId, { timelineStart: Math.max(0, newStart) }, { skipHistory: true });
-  }, [updateClip]);
+    commitProjectEdit(prev => {
+      const targetTrack = prev.timeline.tracks.find(t => t.clips.some(c => c.id === clipId));
+      if (!targetTrack) return prev;
+
+      const updatedTracks = prev.timeline.tracks.map(t => {
+        if (t.id !== targetTrack.id) return t;
+        if (t.id === MAIN_VIDEO_TRACK_ID) {
+          return { ...t, clips: moveClipMagnetically(t.clips, clipId, newStart) };
+        }
+        return {
+          ...t,
+          clips: t.clips.map(c => (c.id === clipId ? { ...c, timelineStart: Math.max(0, newStart) } : c)),
+        };
+      });
+
+      return {
+        ...prev,
+        timeline: {
+          ...prev.timeline,
+          duration: computeElasticTimelineDuration(updatedTracks, prev.timeline.duration),
+          tracks: updatedTracks,
+        },
+      };
+    }, { skipHistory: true });
+  }, [commitProjectEdit]);
 
   // Commit Move Clip to Undo History on Mouse Up
   const commitMoveClip = useCallback((clipId: string, prevStart: number, newStart: number) => {
@@ -649,13 +853,32 @@ export function EditorProvider({ children }: { children: React.ReactNode }) {
 
   // Trim Clip in real-time during drag without polluting history
   const trimClipTimeline = useCallback((clipId: string, newTimelineStart: number, newDuration: number, newSourceStart: number, newSourceEnd: number) => {
-    updateClip(clipId, {
-      timelineStart: Math.max(0, newTimelineStart),
-      duration: Math.max(0.2, newDuration),
-      sourceStart: Math.max(0, newSourceStart),
-      sourceEnd: Math.max(newSourceStart + 0.2, newSourceEnd)
+    commitProjectEdit(prev => {
+      const rawTracks = prev.timeline.tracks.map(track => ({
+        ...track,
+        clips: track.clips.map(clip =>
+          clip.id === clipId
+            ? {
+                ...clip,
+                timelineStart: Math.max(0, newTimelineStart),
+                duration: Math.max(0.2, newDuration),
+                sourceStart: Math.max(0, newSourceStart),
+                sourceEnd: Math.max(newSourceStart + 0.2, newSourceEnd),
+              }
+            : clip
+        ),
+      }));
+      const finalTracks = enforceMainTrackMagnetism(rawTracks);
+      return {
+        ...prev,
+        timeline: {
+          ...prev.timeline,
+          duration: computeElasticTimelineDuration(finalTracks, prev.timeline.duration),
+          tracks: finalTracks,
+        },
+      };
     }, { skipHistory: true });
-  }, [updateClip]);
+  }, [commitProjectEdit]);
 
   // Commit Trim to History on Mouse Up
   const commitTrimClip = useCallback((
@@ -796,9 +1019,14 @@ export function EditorProvider({ children }: { children: React.ReactNode }) {
         });
       }
 
+      const magnetizedTracks = enforceMainTrackMagnetism(finalTracks);
       return {
         ...prev,
-        timeline: { ...prev.timeline, tracks: finalTracks }
+        timeline: {
+          ...prev.timeline,
+          duration: computeElasticTimelineDuration(magnetizedTracks, prev.timeline.duration),
+          tracks: magnetizedTracks,
+        }
       };
     }, { label: 'Move clip to track' });
   }, [commitProjectEdit]);
@@ -825,6 +1053,12 @@ export function EditorProvider({ children }: { children: React.ReactNode }) {
 
       const finalTracks = strippedTracks.map(t => {
         if (t.id !== targetTrackId) return t;
+        if (t.id === MAIN_VIDEO_TRACK_ID) {
+          return {
+            ...t,
+            clips: moveClipMagnetically([...t.clips, clipToPlace], clipToPlace.id, proposedStart),
+          };
+        }
         if (!enableAutoAlign) {
           return { ...t, clips: [...t.clips, clipToPlace] };
         }
@@ -845,9 +1079,14 @@ export function EditorProvider({ children }: { children: React.ReactNode }) {
         };
       });
 
+      const magnetizedTracks = enforceMainTrackMagnetism(finalTracks);
       return {
         ...prev,
-        timeline: { ...prev.timeline, tracks: finalTracks },
+        timeline: {
+          ...prev.timeline,
+          duration: computeElasticTimelineDuration(magnetizedTracks, prev.timeline.duration),
+          tracks: magnetizedTracks,
+        },
       };
     }, { label: 'Auto-align timeline drop' });
   }, [commitProjectEdit]);
@@ -1094,9 +1333,14 @@ export function EditorProvider({ children }: { children: React.ReactNode }) {
         return t;
       });
 
+      const magnetizedTracks = enforceMainTrackMagnetism(finalTracks);
       return {
         ...prev,
-        timeline: { ...prev.timeline, tracks: finalTracks }
+        timeline: {
+          ...prev.timeline,
+          duration: computeElasticTimelineDuration(magnetizedTracks, prev.timeline.duration),
+          tracks: magnetizedTracks,
+        }
       };
     }, { label: 'Extract audio', selectClipId: newAudioId });
   }, [findClipById, commitProjectEdit]);
@@ -1110,21 +1354,24 @@ export function EditorProvider({ children }: { children: React.ReactNode }) {
     }
 
     const splitOffset = currentTime - clip.timelineStart;
+    const sourceSplitDelta = mapTimelineToSourceOffset(clip, splitOffset);
     const firstDuration = splitOffset;
     const secondDuration = clip.duration - splitOffset;
 
     const firstClip: TimelineClip = {
       ...clip,
-      sourceEnd: clip.sourceStart + firstDuration,
-      duration: firstDuration
+      sourceEnd: clip.sourceStart + sourceSplitDelta,
+      duration: firstDuration,
+      speedCurve: undefined,
     };
 
     const secondClip: TimelineClip = {
       ...clip,
       id: `${clip.id}-split-${Date.now()}`,
       timelineStart: currentTime,
-      sourceStart: clip.sourceStart + splitOffset,
-      duration: secondDuration
+      sourceStart: clip.sourceStart + sourceSplitDelta,
+      duration: secondDuration,
+      speedCurve: undefined,
     };
 
     commitProjectEdit(prev => {
@@ -1135,11 +1382,12 @@ export function EditorProvider({ children }: { children: React.ReactNode }) {
         }
         return t;
       });
+      const magnetizedTracks = enforceMainTrackMagnetism(newTracks);
       return {
         ...prev,
         timeline: {
           ...prev.timeline,
-          tracks: newTracks
+          tracks: magnetizedTracks
         }
       };
     }, { label: 'Split clip at playhead' });
@@ -1148,15 +1396,19 @@ export function EditorProvider({ children }: { children: React.ReactNode }) {
   // Delete Clip
   const deleteClip = useCallback((clipId: string) => {
     commitProjectEdit(prev => {
-      const newTracks = prev.timeline.tracks.map(t => ({
+      const rawTracks = prev.timeline.tracks.map(t => ({
         ...t,
         clips: t.clips.filter(c => c.id !== clipId)
       }));
+      const newTracks = enforceMainTrackMagnetism(rawTracks);
       return {
         ...prev,
         timeline: {
           ...prev.timeline,
-          tracks: newTracks
+          tracks: newTracks,
+          transitions: (prev.timeline.transitions || []).filter(
+            tr => tr.fromClipId !== clipId && tr.toClipId !== clipId
+          ),
         }
       };
     }, {
@@ -1287,7 +1539,7 @@ export function EditorProvider({ children }: { children: React.ReactNode }) {
         nextStart = lastClip.timelineStart + lastClip.duration;
       }
 
-      const clipDur = Math.min(asset.duration || 10, 15);
+      const clipDur = Math.max(0.5, asset.duration || 10);
       const newClip: TimelineClip = {
         id: newClipId,
         trackId: resolvedTrack.id,
@@ -1311,10 +1563,11 @@ export function EditorProvider({ children }: { children: React.ReactNode }) {
         fadeOut: 0.2
       };
 
-      const finalTracks = updatedTracks.map(t => 
+      const rawTracks = updatedTracks.map(t => 
         t.id === resolvedTrack.id ? { ...t, clips: [...t.clips, newClip] } : t
       );
-      const totalDur = Math.max(prev.timeline.duration, newClip.timelineStart + newClip.duration + 5);
+      const finalTracks = enforceMainTrackMagnetism(rawTracks);
+      const totalDur = computeElasticTimelineDuration(finalTracks, prev.timeline.duration);
 
       return {
         ...prev,
@@ -1327,12 +1580,15 @@ export function EditorProvider({ children }: { children: React.ReactNode }) {
     }, { label: `Add ${asset.name} to track`, selectClipId: newClipId });
   }, [commitProjectEdit]);
 
-  // Auto add media to timeline (dynamically finding or creating a suitable track)
+  // Auto add media to timeline (routes video/image to Main Video V1 by default, audio to Audio track)
   const autoAddMediaToTimeline = useCallback((asset: MediaAsset) => {
     const isAudio = asset.type === 'audio';
     const targetType: TrackType = isAudio ? 'audio' : 'video';
     
-    const existingTrack = projectRef.current.timeline.tracks.find(t => t.type === targetType);
+    const existingTrack = !isAudio
+      ? (projectRef.current.timeline.tracks.find(t => t.id === MAIN_VIDEO_TRACK_ID) ||
+         projectRef.current.timeline.tracks.find(t => t.type === 'video'))
+      : projectRef.current.timeline.tracks.find(t => t.type === targetType);
     if (existingTrack) {
       addClipToTrack(existingTrack.id, asset);
     } else {
@@ -1389,11 +1645,159 @@ export function EditorProvider({ children }: { children: React.ReactNode }) {
         t.id === textTrack!.id ? { ...t, clips: [...t.clips, newClip] } : t
       );
 
+      const magnetizedTracks = enforceMainTrackMagnetism(finalTracks);
       return {
         ...prev,
-        timeline: { ...prev.timeline, tracks: finalTracks }
+        timeline: {
+          ...prev.timeline,
+          duration: computeElasticTimelineDuration(magnetizedTracks, prev.timeline.duration),
+          tracks: magnetizedTracks,
+        }
       };
     }, { label: 'Add caption clip', selectClipId: newClipId });
+  }, [commitProjectEdit]);
+
+  const addRichTextClip = useCallback((
+    template: TextStyleTemplate,
+    options?: { timelineStart?: number; trackId?: string; x?: number; y?: number }
+  ) => {
+    const newClipId = `text-${Date.now()}`;
+    commitProjectEdit(prev => {
+      let targetTrack = options?.trackId
+        ? prev.timeline.tracks.find(t => t.id === options.trackId)
+        : prev.timeline.tracks.find(t => t.type === 'text');
+      const updatedTracks = [...prev.timeline.tracks];
+
+      if (!targetTrack) {
+        targetTrack = {
+          id: `track-t${Date.now().toString().slice(-4)}`,
+          name: 'Text & Captions',
+          type: 'text',
+          muted: false,
+          locked: false,
+          visible: true,
+          clips: [],
+        };
+        updatedTracks.unshift(targetTrack);
+      }
+
+      const startAt = Math.max(0, options?.timelineStart ?? currentTimeRef.current);
+      const newClip: TimelineClip = {
+        id: newClipId,
+        trackId: targetTrack.id,
+        name: template.label,
+        type: 'text',
+        timelineStart: startAt,
+        sourceStart: 0,
+        sourceEnd: 4,
+        duration: 4,
+        transform: {
+          x: options?.x ?? 0,
+          y: options?.y ?? 20,
+          scale: 1,
+          rotation: 0,
+          opacity: 1,
+        },
+        effects: [],
+        animations: template.inAnim
+          ? { in: { presetId: template.inAnim, duration: 0.45, intensity: 1 } }
+          : undefined,
+        volume: 0,
+        muted: true,
+        fadeIn: 0.2,
+        fadeOut: 0.2,
+        textContent: template.previewText,
+        textColor: template.textColor,
+        textBgColor: template.textBgColor,
+        fontSize: template.fontSize,
+        fontFamily: template.fontFamily,
+        fontWeight: template.fontWeight,
+        strokeWidth: template.strokeWidth,
+        strokeColor: template.strokeColor,
+        shadowBlur: template.shadowBlur,
+        shadowColor: template.shadowColor,
+        bgPadding: template.bgPadding,
+        bgRadius: template.bgRadius,
+        letterSpacing: template.letterSpacing,
+        gradientColors: template.gradientColors,
+      };
+
+      const finalTracks = updatedTracks.map(t =>
+        t.id === targetTrack!.id ? { ...t, clips: [...t.clips, newClip] } : t
+      );
+
+      return {
+        ...prev,
+        timeline: { ...prev.timeline, tracks: finalTracks },
+      };
+    }, { label: `Add ${template.label} text`, selectClipId: newClipId });
+  }, [commitProjectEdit]);
+
+  const addStickerClip = useCallback((
+    sticker: StickerPresetDef,
+    options?: { timelineStart?: number; trackId?: string; x?: number; y?: number }
+  ) => {
+    const newClipId = `sticker-${Date.now()}`;
+    commitProjectEdit(prev => {
+      let targetTrack = options?.trackId
+        ? prev.timeline.tracks.find(t => t.id === options.trackId)
+        : prev.timeline.tracks.find(t => t.id === 'track-v2') || prev.timeline.tracks.find(t => t.type === 'video');
+      const updatedTracks = [...prev.timeline.tracks];
+
+      if (!targetTrack) {
+        targetTrack = {
+          id: `track-v${Date.now().toString().slice(-4)}`,
+          name: 'Overlay Stickers',
+          type: 'video',
+          muted: false,
+          locked: false,
+          visible: true,
+          clips: [],
+        };
+        updatedTracks.unshift(targetTrack);
+      }
+
+      const startAt = Math.max(0, options?.timelineStart ?? currentTimeRef.current);
+      const newClip: TimelineClip = {
+        id: newClipId,
+        trackId: targetTrack.id,
+        name: sticker.label,
+        type: 'sticker',
+        timelineStart: startAt,
+        sourceStart: 0,
+        sourceEnd: 3.5,
+        duration: 3.5,
+        transform: {
+          x: options?.x ?? 0,
+          y: options?.y ?? 0,
+          scale: 0.45,
+          rotation: 0,
+          opacity: 1,
+        },
+        effects: [],
+        volume: 0,
+        muted: true,
+        fadeIn: 0,
+        fadeOut: 0,
+        stickerId: sticker.id,
+        stickerSvg: sticker.svg,
+        stickerColor: sticker.color,
+      };
+
+      const rawTracks = updatedTracks.map(t =>
+        t.id === targetTrack!.id ? { ...t, clips: [...t.clips, newClip] } : t
+      );
+      const finalTracks = enforceMainTrackMagnetism(rawTracks);
+
+      return {
+        ...prev,
+        timeline: {
+          ...prev.timeline,
+          duration: computeElasticTimelineDuration(finalTracks, prev.timeline.duration),
+          tracks: finalTracks,
+        },
+      };
+    }, { label: `Add sticker ${sticker.label}`, selectClipId: newClipId });
   }, [commitProjectEdit]);
 
   // Toggle Track properties
@@ -1762,6 +2166,7 @@ export function EditorProvider({ children }: { children: React.ReactNode }) {
         sendClipperToEditor,
         saveNow,
         togglePlay,
+        pausePlayback,
         seek,
         setPlaybackRate,
         setZoom,
@@ -1776,6 +2181,13 @@ export function EditorProvider({ children }: { children: React.ReactNode }) {
         updateClipTransform,
         updateClipEffect,
         batchUpdateClipEffects,
+        applyClipFilterPreset,
+        updateClipMask,
+        updateClipAnimation,
+        updateClipSpeedCurve,
+        toggleClipLayerEffect,
+        setClipTransition,
+        removeClipTransition,
         updateProjectSettings,
         moveClip,
         commitMoveClip,
@@ -1798,6 +2210,8 @@ export function EditorProvider({ children }: { children: React.ReactNode }) {
         addClipToTrack,
         autoAddMediaToTimeline,
         addTextClip,
+        addRichTextClip,
+        addStickerClip,
         importMediaAsset,
         extractAudioFromClip,
         addTrack,
